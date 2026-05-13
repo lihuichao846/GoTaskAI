@@ -1,90 +1,176 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"gotaskai/internal/api"
+	"gotaskai/internal/config"
 	"gotaskai/internal/db"
 	"gotaskai/internal/middleware"
 	"gotaskai/internal/model"
+	"gotaskai/internal/pkg/kag"
+	"gotaskai/internal/pkg/llm"
+	"gotaskai/internal/pkg/mcpclient"
 	"gotaskai/internal/queue"
 	"gotaskai/internal/worker"
-	"log"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/hibiken/asynq"
+	"github.com/hibiken/asynqmon"
 )
 
 // main 是 GoTaskAI 平台的启动入口函数
 func main() {
-	// 0. 初始化数据库和缓存
-	// 在生产环境中这些配置应当通过环境变量或配置文件注入
-	// 注意：因为本地 3306 端口被占用，我们已将 Docker 的 MySQL 映射到 3307 端口
-	dsn := "root:root@tcp(127.0.0.1:3307)/gotaskai?charset=utf8mb4&parseTime=True&loc=Local"
-	mysqlDB := db.InitMySQL(dsn)
+	// 0. 初始化配置 (企业级实践：使用配置文件 + 环境变量)
+	config.InitConfig("config/config.yaml")
+	cfg := config.AppConfig
 
-	// 自动迁移数据库表结构 (创建或更新 Task 表和 User 表)
-	err := mysqlDB.AutoMigrate(&model.Task{}, &model.User{})
-	if err != nil {
-		log.Fatalf("Failed to auto migrate database: %v", err)
+	// 初始化企业级结构化日志 (使用 Go 1.21+ 标准库 log/slog)
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+	slog.Info("Starting GoTaskAI Application...")
+
+	// 1. 初始化数据库和缓存
+	mysqlDB := db.InitMySQL(cfg.MySQL.DSN)
+	sqlDB, err := mysqlDB.DB()
+	if err == nil {
+		sqlDB.SetMaxIdleConns(cfg.MySQL.MaxIdleConns)
+		sqlDB.SetMaxOpenConns(cfg.MySQL.MaxOpenConns)
 	}
 
-	redisClient := db.InitRedis("127.0.0.1:6379", "", 0)
+	// 自动迁移数据库表结构 (创建或更新 Task 表和 User 表)
+	if err := mysqlDB.AutoMigrate(&model.Task{}, &model.User{}); err != nil {
+		slog.Error("Failed to auto migrate database", "error", err)
+		os.Exit(1)
+	}
 
-	// 1. 初始化核心任务管理器 (Task Manager)
-	// 注入 MySQL 和 Redis 实例，设置内存队列 (Channel) 的缓冲容量为 1000
-	manager := queue.NewTaskManager(1000, mysqlDB, redisClient)
+	redisClient := db.InitRedis(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
 
-	// 2. 初始化并发工作池 (Worker Pool)
-	// 设置并发数为 5，意味着服务端可以同时处理 5 个 AI 任务
-	pool := worker.NewPool(5, manager)
-	// 启动后台 Goroutines 进行队列消费
+	// 2. 初始化核心任务管理器 (Task Manager)
+	redisOpt := asynq.RedisClientOpt{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB}
+	manager := queue.NewTaskManager(mysqlDB, redisClient, redisOpt)
+	defer manager.Close()
+
+	// 初始化 Neo4j 客户端及 KAG 管理器
+	var kagManager *kag.KAGManager
+	if cfg.Neo4j.URI != "" {
+		neo4jDriver := db.InitNeo4j(cfg.Neo4j.URI, cfg.Neo4j.Username, cfg.Neo4j.Password)
+		defer neo4jDriver.Close(context.Background())
+		kagManager = kag.NewKAGManager(neo4jDriver, llm.NewClient())
+		slog.Info("Connected to Neo4j successfully, KAG enabled")
+	}
+
+	// 初始化 MCP 客户端
+	mcpCtx := context.Background()
+	mcpServerPath, _ := filepath.Abs("bin/search_mcp.exe")
+	mcpClient, err := mcpclient.NewWrapper(mcpCtx, mcpServerPath)
+	if err != nil {
+		slog.Warn("Failed to connect to MCP Server, tools will be disabled", "error", err)
+	} else {
+		slog.Info("Connected to MCP Server successfully")
+		defer mcpClient.Close()
+	}
+
+	// 3. 初始化并发工作池 (Worker Pool)
+	pool := worker.NewPool(cfg.Queue.Workers, manager, redisOpt, mcpClient, kagManager)
 	pool.Start()
+	slog.Info("Worker pool started", "workers", cfg.Queue.Workers)
 
-	// 3. 初始化 HTTP 路由与控制器 (API Handlers)
-	handler := api.NewHandler(manager)
-	authHandler := api.NewAuthHandler(mysqlDB)
+	// 4. 初始化 HTTP 路由与控制器 (API Handlers)
+	handler := api.NewHandler(manager, mcpClient)
+	authHandler := api.NewAuthHandler(mysqlDB, redisClient)
+	ragHandler := api.NewRAGHandler(redisClient, kagManager)
 
 	// --- 引入 Gin 框架进行路由管理 ---
-
-	// 初始化一个带有默认日志(Logger)和错误恢复(Recovery)中间件的 Gin 引擎
+	if cfg.Server.Mode == "release" {
+		gin.SetMode(gin.ReleaseMode)
+	}
 	r := gin.Default()
 
-	// 4. 配置静态文件托管
-	// 直接将 "/" 映射到我们前端的入口文件
+	// 配置静态文件托管
 	r.StaticFile("/", "./public/index.html")
 
-	// 5. 使用 Gin 的“路由分组 (Group)”功能
-	// 这样可以更好地组织代码，所有 /api 开头的请求都在这个分组里
+	// 挂载 Asynq 官方的 Web UI 面板
+	mon := asynqmon.New(asynqmon.Options{
+		RootPath:     "/admin/tasks",
+		RedisConnOpt: redisOpt,
+	})
+	r.Any("/admin/tasks/*any", gin.WrapH(mon))
+
+	// 使用 Gin 的“路由分组 (Group)”功能
 	apiGroup := r.Group("/api")
 	{
-		// 认证相关的路由 (不需要登录)
+		adminGroup := apiGroup.Group("/admin")
+		{
+			adminGroup.POST("/rag/ingest", ragHandler.Ingest)
+			adminGroup.POST("/kag/ingest", ragHandler.KAGIngest) // 新增 KAG 图谱录入接口
+		}
+
 		authGroup := apiGroup.Group("/auth")
 		{
 			authGroup.POST("/register", authHandler.Register)
 			authGroup.POST("/login", authHandler.Login)
+			authGroup.POST("/forgot-password/request-code", authHandler.RequestResetCode)
+			authGroup.POST("/forgot-password/reset", authHandler.ResetPassword)
 		}
 
-		// 在 /api 下继续细分出 /tasks 组
 		tasksGroup := apiGroup.Group("/tasks")
-		// 应用 Auth 中间件，保护 tasks 接口
 		tasksGroup.Use(middleware.AuthMiddleware())
 		{
-			// Gin 会自动根据 HTTP Method 进行精准匹配，省去了原先在 handler 里手动写 if r.Method 校验的麻烦
-			// 为提交接口单独增加“限流中间件”：每个用户（IP）每分钟最多只能提交 3 个任务，防止恶意刷单
-			tasksGroup.POST("/submit", middleware.RateLimitMiddleware(redisClient, 3, time.Minute), handler.SubmitTask)             // 处理提交任务
-			tasksGroup.POST("/batch-submit", middleware.RateLimitMiddleware(redisClient, 1, time.Minute), handler.BatchSubmitTasks) // 处理批量提交任务，限流更严格
-			tasksGroup.GET("/:id", handler.GetTaskStatus)                                                                           // 处理查询单任务状态
-			tasksGroup.GET("", handler.ListTasks)                                                                                   // 处理获取所有任务列表
-			tasksGroup.DELETE("/:id", handler.DeleteTask)                                                                           // 处理删除单任务
-			tasksGroup.POST("/:id/retry", handler.RetryTask)                                                                        // 处理失败任务重试
-			tasksGroup.POST("/:id/cancel", handler.CancelTask)                                                                      // 处理任务取消
+			tasksGroup.POST("/submit", middleware.RateLimitMiddleware(redisClient, 3, time.Minute), handler.SubmitTask)
+			tasksGroup.POST("/batch-submit", middleware.RateLimitMiddleware(redisClient, 1, time.Minute), handler.BatchSubmitTasks)
+			tasksGroup.POST("/optimize-prompt", middleware.RateLimitMiddleware(redisClient, 3, time.Minute), handler.OptimizePrompt) // 新增：Prompt 优化接口并加入限流
+			tasksGroup.GET("/:id", handler.GetTaskStatus)
+			tasksGroup.GET("", handler.ListTasks)
+			tasksGroup.DELETE("/:id", handler.DeleteTask)
+			tasksGroup.DELETE("/session/:id", handler.DeleteSession)
+			tasksGroup.POST("/:id/retry", handler.RetryTask)
+			tasksGroup.POST("/:id/cancel", handler.CancelTask)
 		}
-		// SSE 接口由于不能自定义 Header，通常通过 URL 传 token，我们把它挂在鉴权中间件外面或者单独处理
 		apiGroup.GET("/tasks/stream", handler.StreamTasks)
 	}
 
-	// 6. 启动 HTTP 监听服务
-	log.Println("GoTaskAI server listening on :8080")
-	if err := r.Run(":8080"); err != nil {
-		log.Fatalf("Server failed: %v", err)
+	// 5. 启动 HTTP 监听服务并配置优雅重启 (Graceful Shutdown)
+	srv := &http.Server{
+		Addr:    fmt.Sprintf(":%d", cfg.Server.Port),
+		Handler: r,
 	}
+
+	// 开启独立 goroutine 启动服务
+	go func() {
+		slog.Info("GoTaskAI server listening", "port", cfg.Server.Port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("Server failed", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	// 6. 优雅退出处理：监听系统级退出信号
+	quit := make(chan os.Signal, 1)
+	// kill (no param) default send syscall.SIGTERM
+	// kill -2 is syscall.SIGINT (Ctrl+C)
+	// kill -9 is syscall.SIGKILL but can't be catch, so don't need add it
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	slog.Info("Shutdown Signal Received, terminating gracefully...")
+
+	// 设置一个 5 秒的超时上下文，给服务 5 秒时间处理正在进行的请求
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		slog.Error("Server Shutdown Error", "error", err)
+	}
+
+	// 可以在这里做其他清理工作（如关闭数据库连接、停止 worker pool 等）
+	pool.Stop() // 停止消费队列任务
+	slog.Info("Server Exiting")
 }

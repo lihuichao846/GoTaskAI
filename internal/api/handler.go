@@ -1,8 +1,11 @@
 package api
 
 import (
+	"context"
 	"gotaskai/internal/model"
 	"gotaskai/internal/pkg/jwt"
+	"gotaskai/internal/pkg/llm"
+	"gotaskai/internal/pkg/mcpclient"
 	"gotaskai/internal/queue"
 	"net/http"
 	"time"
@@ -13,12 +16,18 @@ import (
 
 // Handler 封装了 HTTP API 的路由处理逻辑
 type Handler struct {
-	manager *queue.TaskManager // 依赖注入任务管理器
+	manager   *queue.TaskManager // 依赖注入任务管理器
+	llmClient *llm.Client        // 大模型客户端用于同步的 prompt 优化
+	mcpClient *mcpclient.Wrapper // MCP 客户端用于联网搜索等工具
 }
 
-// NewHandler 初始化 API 处理器
-func NewHandler(manager *queue.TaskManager) *Handler {
-	return &Handler{manager: manager}
+// NewHandler 创建 Handler 实例，注入依赖
+func NewHandler(manager *queue.TaskManager, mcpClient *mcpclient.Wrapper) *Handler {
+	return &Handler{
+		manager:   manager,
+		llmClient: llm.NewClient(),
+		mcpClient: mcpClient,
+	}
 }
 
 // BatchSubmitRequest 定义批量提交任务的请求体
@@ -41,17 +50,22 @@ func (h *Handler) BatchSubmitTasks(c *gin.Context) {
 		if taskReq.Priority == 0 {
 			taskReq.Priority = model.PriorityNormal
 		}
+		if taskReq.Type == "" {
+			taskReq.Type = model.TypeCustom
+		}
 
 		task := &model.Task{
-			ID:        uuid.New().String(),
-			UserID:    userID,
-			Type:      taskReq.Type,
-			Priority:  taskReq.Priority,
-			Payload:   taskReq.Payload,
-			Status:    model.StatusPending,
-			MaxRetry:  3,
-			CreatedAt: time.Now(),
-			UpdatedAt: time.Now(),
+			ID:           uuid.New().String(),
+			UserID:       userID,
+			SessionID:    taskReq.SessionID,
+			Type:         taskReq.Type,
+			SystemPrompt: taskReq.SystemPrompt,
+			Priority:     taskReq.Priority,
+			Payload:      taskReq.Payload,
+			Status:       model.StatusPending,
+			MaxRetry:     3,
+			CreatedAt:    time.Now(),
+			UpdatedAt:    time.Now(),
 		}
 
 		if err := h.manager.AddTask(task); err != nil {
@@ -78,9 +92,41 @@ func (h *Handler) BatchSubmitTasks(c *gin.Context) {
 }
 
 type SubmitRequest struct {
-	Type     model.TaskType     `json:"type" binding:"required"`    // 任务类型，如 summary, generation 等
-	Payload  string             `json:"payload" binding:"required"` // 任务的具体载荷/输入数据
-	Priority model.TaskPriority `json:"priority"`                   // 任务优先级 (1:低, 2:普通, 3:高)
+	Type         model.TaskType     `json:"type"`                       // 任务类型，默认为 custom
+	SessionID    string             `json:"session_id"`                 // 关联的会话ID（用于多轮对话上下文）
+	SystemPrompt string             `json:"system_prompt"`              // AI 角色设定/系统提示词
+	Payload      string             `json:"payload" binding:"required"` // 任务的具体载荷/输入数据
+	Priority     model.TaskPriority `json:"priority"`                   // 任务优先级 (1:低, 2:普通, 3:高)
+}
+
+type OptimizePromptRequest struct {
+	Prompt string `json:"prompt" binding:"required"`
+}
+
+// OptimizePrompt 处理 POST /api/tasks/optimize-prompt 请求，调用 LLM 优化用户输入的 Prompt
+func (h *Handler) OptimizePrompt(c *gin.Context) {
+	var req OptimizePromptRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	systemPrompt := "你是一个专业的 Prompt 工程师。用户会输入一个简单的任务描述，请你将其扩充、优化为一个专业、结构清晰的大模型 System Prompt。直接返回优化后的 Prompt 文本，不需要任何寒暄或解释。"
+
+	// 设置 15 秒的超时时间，因为这要求是同步响应
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// 优化 prompt 只是一个单轮请求，不需要历史记录，允许使用联网工具获取最新背景信息
+	optimizedPrompt, err := h.llmClient.Generate(ctx, systemPrompt, nil, req.Prompt, h.mcpClient)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to optimize prompt: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"optimized_prompt": optimizedPrompt,
+	})
 }
 
 // SubmitTask 处理 POST /api/tasks/submit 请求，接收客户端参数并创建新任务
@@ -92,9 +138,12 @@ func (h *Handler) SubmitTask(c *gin.Context) {
 		return
 	}
 
-	// 默认设置普通优先级
+	// 默认设置普通优先级和通用类型
 	if req.Priority == 0 {
 		req.Priority = model.PriorityNormal
+	}
+	if req.Type == "" {
+		req.Type = model.TypeCustom
 	}
 
 	// 从中间件上下文中提取用户 ID
@@ -102,15 +151,17 @@ func (h *Handler) SubmitTask(c *gin.Context) {
 
 	// 2. 构造完整的任务实体
 	task := &model.Task{
-		ID:        uuid.New().String(), // 使用 UUID 保证任务 ID 的全局唯一性
-		UserID:    userID,              // 绑定任务与用户的关系
-		Type:      req.Type,
-		Priority:  req.Priority, // 设置任务优先级
-		Payload:   req.Payload,
-		Status:    model.StatusPending, // 新建任务初始状态为"等待中"
-		MaxRetry:  3,                   // 默认最大允许重试 3 次
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		ID:           uuid.New().String(), // 使用 UUID 保证任务 ID 的全局唯一性
+		UserID:       userID,              // 绑定任务与用户的关系
+		SessionID:    req.SessionID,
+		Type:         req.Type,
+		SystemPrompt: req.SystemPrompt,
+		Priority:     req.Priority, // 设置任务优先级
+		Payload:      req.Payload,
+		Status:       model.StatusPending, // 新建任务初始状态为"等待中"
+		MaxRetry:     3,                   // 默认最大允许重试 3 次
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
 	}
 
 	// 3. 尝试将任务加入到队列管理器
@@ -192,6 +243,26 @@ func (h *Handler) DeleteTask(c *gin.Context) {
 
 	// 3. 返回成功响应
 	c.JSON(http.StatusOK, gin.H{"message": "Task deleted successfully"})
+}
+
+// DeleteSession 处理 DELETE /api/tasks/session/:id 请求，删除整个会话
+func (h *Handler) DeleteSession(c *gin.Context) {
+	sessionID := c.Param("id")
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing session id"})
+		return
+	}
+
+	userIDVal, _ := c.Get("userID")
+	userID := userIDVal.(uint)
+
+	// 调用 Manager 删除该会话下的所有任务
+	if err := h.manager.DeleteSession(sessionID, userID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete session"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Session deleted successfully"})
 }
 
 // RetryTask 处理 POST /api/tasks/:id/retry 请求，手动重试失败的任务

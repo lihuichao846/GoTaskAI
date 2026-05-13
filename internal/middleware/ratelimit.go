@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -15,9 +16,15 @@ import (
 func RateLimitMiddleware(rdb *redis.Client, maxRequests int, window time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 1. 获取用户标识
-		// 因为我们目前没有登录系统，我们用用户的 IP 地址来模拟“用户维度”
-		clientIP := c.ClientIP()
-		key := "rate_limit:ip:" + clientIP
+		// 优先使用已登录用户的 userID，如果没有登录则降级使用 IP 地址
+		var key string
+		userID, exists := c.Get("userID")
+		if exists {
+			key = "rate_limit:user:" + fmt.Sprint(userID)
+		} else {
+			clientIP := c.ClientIP()
+			key = "rate_limit:ip:" + clientIP
+		}
 
 		ctx := context.Background()
 

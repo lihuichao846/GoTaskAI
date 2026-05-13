@@ -1,6 +1,9 @@
-# GoTaskAI：从零到一的高并发任务调度平台 (新手进阶学习项目)
+# GoTaskAI：高并发 AI 任务调度与 RAG 对话平台
 
-**GoTaskAI** 是一个专为 Go 语言初学者和进阶者设计的**学习型高并发架构项目**。
+> **💡 一句话介绍本项目：**
+> 这是一个基于 `Go + Gin + Vue3` 构建的企业级异步任务调度与大模型对话平台。它利用 `Redis + Asynq` 实现了支持多优先级与故障重试的高并发消息队列，通过 `SSE` 技术实现前端状态实时流式推送，并深度集成了 `LangChainGo` 框架构建支持私有知识库的 RAG (检索增强生成) 引擎，解决了大模型调用耗时长、并发低和知识盲区的痛点。
+
+**GoTaskAI** 也是一个专为 Go 语言初学者和进阶者设计的**学习型高并发架构项目**。
 它模拟了真实企业中“AI 耗时任务处理”（如大模型生成、OCR 识别）的场景，带领你一步步从原生的 `net/http` 走到工业级的 `Gin + GORM + Redis` 架构。
 
 通过这个项目，你不仅能学到 Go 语言的语法，更能深刻理解**高并发处理、队列调度、缓存一致性、SSE 实时推送**等核心后端工程思想。
@@ -30,20 +33,52 @@
 
 ## 🏗️ 架构图解
 
+### 1. 核心数据流转架构
+
 ```text
-[用户浏览器 (Vue3)] 
+[用户浏览器 (Vue3前端)] 
        │ 
-       │ (1. 提交任务 / 批量提交) -> JWT 鉴权 -> IP 限流校验
+       │ (1. HTTP: 提交任务 / RAG问答) -> JWT 鉴权 -> IP 限流校验
        ▼
-[Gin HTTP Server (API 层)]
+[Gin HTTP Server (API 接入层)]
        │ 
-       │ (2. 生成 UUID，持久化到 MySQL，更新 Redis)
+       │ (2. 生成 UUID，持久化到 MySQL，状态存入 Redis)
        ▼
-[Task Manager (调度层)] ──(3. 根据优先级推入 Channel)──▶ [High / Normal / Low Queues]
+[Task Manager (调度层)] ──(3. 根据优先级打包推入 Asynq)──▶ [Redis (High/Default/Low 队列)]
        │                                                         │
-       │ (5. 状态变更触发 SSE 广播推给前端)                      │ (4. Worker 空闲时抢占执行)
+       │ (5. 状态变更触发 SSE 广播推给前端)                      │ (4. Worker 阻塞轮询抢占执行)
        ▼                                                         ▼
 [SSE Stream (长连接推送)] ◀───────────────────────────── [Worker Pool (后台并发池)]
+                                                                 │
+                                                                 │ (6. 检索私有知识库 / 执行大模型调用)
+                                                                 ▼
+                                                        [Ollama / Qwen2.5 / Bge-m3]
+```
+
+### 2. 项目目录结构图
+
+```text
+GoTaskAI/
+├── bin/                    # 编译后的可执行文件 (如 MCP 联网搜索插件)
+├── config/                 # 项目配置文件 (config.yaml)
+├── data/                   # 本地测试数据和 RAG 知识库原始文档 (.md)
+├── docs/                   # 📚 核心原理与架构文档集 (强烈建议阅读！)
+├── internal/               # 核心业务代码 (私有包，不对外暴露)
+│   ├── api/                # API 接入层 (Gin Controllers，如 handler.go, auth.go, rag.go)
+│   ├── config/             # 配置解析逻辑
+│   ├── db/                 # 数据库初始化 (MySQL/Redis 链接)
+│   ├── middleware/         # Gin 中间件 (JWT 鉴权, Redis 限流)
+│   ├── model/              # 数据模型层 (GORM 实体定义: User, Task)
+│   ├── pkg/                # 通用工具包 (JWT, LLM 客户端, MCP 客户端)
+│   ├── queue/              # 任务调度层 (TaskManager, 封装 Asynq 和 SSE)
+│   └── worker/             # 任务执行层 (Pool, 消费队列并调用大模型/RAG)
+├── public/                 # 前端静态资源 (Vue3 + Tailwind 编写的 index.html)
+├── test/                   # 针对各个模块的独立测试代码 (LLM, MCP等)
+├── tools/                  # 独立工具脚本 (如 RAG 数据导入脚本, MCP 插件源码, 密码重置脚本)
+├── docker-compose.yml      # 基础设施容器编排 (MySQL, Redis Stack, Nginx)
+├── go.mod                  # Go 依赖管理文件
+├── main.go                 # 🚀 项目主入口，组装所有组件并启动 HTTP/Asynq 服务
+└── nginx.conf              # Nginx 反向代理与动静分离配置
 ```
 
 ---
@@ -57,6 +92,10 @@
 *   [文件柜与办公桌：为什么我们需要 Redis？](./docs/redis_explanation_guide.md)
 *   [告别轮询：SSE 实时推送原理解析](./docs/sse_vs_polling.md)
 *   [数据库解惑：Navicat、代码与 Docker 卷](./docs/navicat_vs_code_db.md)
+*   [计算机网络底层：I/O 多路复用与 epoll 原理](./docs/io_multiplexing_epoll.md)
+*   [图解网络安全：HTTP vs HTTPS 与握手过程](./docs/http_vs_https_guide.md)
+*   [Go 面试必考：GMP 调度模型与 Channel 原理](./docs/go_gmp_and_channel.md)
+*   [高并发终极方案：Nginx 与 Go 的企业级架构实战](./docs/nginx_architecture_guide.md)
 
 ---
 

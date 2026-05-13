@@ -1,9 +1,10 @@
-# Go 语言数据库操作指南：MySQL (GORM) 与 Redis 
+# Go 语言数据库实战指南：GORM 与 go-redis 
 
 在现代后端开发中，**MySQL** 负责持久化存储重要数据，而 **Redis** 负责高速缓存和应对高并发。
 Go 社区中最主流的两个库分别是操作 MySQL 的 **GORM** 和操作 Redis 的 **go-redis**。
 
 这份文档将带你快速掌握它们的核心用法，并结合我们项目中的 `manager.go` 源码，解释它们是如何协同工作的。
+（关于 MySQL 事务和隔离级别的理论原理解析，请参考单独的 [MySQL 原理文档](mysql_explanation_guide.md)）
 
 ---
 
