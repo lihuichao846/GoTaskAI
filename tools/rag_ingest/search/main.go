@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
 
 	"gotaskai/internal/config"
 
@@ -32,9 +31,9 @@ func main() {
 	}
 
 	// 3. 初始化 Redis 向量存储连接
-	redisURL := config.AppConfig.Redis.Addr
-	if !strings.HasPrefix(redisURL, "redis://") {
-		redisURL = "redis://" + redisURL
+	redisURL := config.AppConfig.Redis.VectorStoreURL()
+	if redisURL == "" {
+		log.Fatalf("RedisVector 需要配置 redis.addr 直连地址")
 	}
 
 	store, err := redisvector.New(
@@ -53,9 +52,10 @@ func main() {
 
 	// 5. 向量检索
 	fmt.Println("正在通过 LangChainGo 进行检索...")
-	
+
 	// 一行代码搞定检索！自动调用 embedder 生成查询向量，自动去 redis 查询
 	// 并且返回的结果已经反序列化为 Document 结构了
+	// 使用 WithScoreThreshold 可以过滤掉相似度过低的噪声文档
 	docs, err := store.SimilaritySearch(ctx, question, 2)
 	if err != nil {
 		log.Fatalf("检索失败: %v", err)
@@ -73,8 +73,8 @@ func main() {
 		if source, ok := doc.Metadata["source"]; ok {
 			fmt.Printf("📂 来源: %v\n", source)
 		}
-		// 如果在 SimilaritySearch 时想拿 score，langchaingo 提供 WithScoreThreshold 等选项，
-		// 返回的 doc.Score 也是有的 (如果版本支持)。这里简单打印内容。
+		// 打印文档相似度得分 (Score)
+		fmt.Printf("⭐ 相似度得分: %f\n", doc.Score)
 		fmt.Printf("📄 文本内容:\n%s\n", doc.PageContent)
 		fmt.Println("--------------------------------------------------")
 	}

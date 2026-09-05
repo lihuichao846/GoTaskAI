@@ -11,7 +11,6 @@ import (
 	"gotaskai/internal/pkg/mcpclient"
 	"gotaskai/internal/queue"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/hibiken/asynq"
@@ -59,21 +58,22 @@ func NewPool(workers int, manager *queue.TaskManager, redisOpt asynq.RedisConnOp
 	if err == nil {
 		embedder, err := embeddings.NewEmbedder(ollamaClient)
 		if err == nil {
-			redisURL := config.AppConfig.Redis.Addr
-			if !strings.HasPrefix(redisURL, "redis://") {
-				redisURL = "redis://" + redisURL
-			}
-			store, err := redisvector.New(
-				context.Background(),
-				redisvector.WithConnectionURL(redisURL),
-				redisvector.WithIndexName("idx:pangu_v2", false), // false 表示不主动创建
-				redisvector.WithEmbedder(embedder),
-			)
-			if err == nil {
-				ragStore = store
-				log.Println("RAG Vector Store initialized in Worker Pool")
+			redisURL := config.AppConfig.Redis.VectorStoreURL()
+			if redisURL == "" {
+				log.Printf("RedisVector disabled: redis.addr is required when Redis Sentinel mode is enabled")
 			} else {
-				log.Printf("Failed to init redisvector: %v", err)
+				store, err := redisvector.New(
+					context.Background(),
+					redisvector.WithConnectionURL(redisURL),
+					redisvector.WithIndexName("idx:pangu_v2", false), // false 表示不主动创建
+					redisvector.WithEmbedder(embedder),
+				)
+				if err == nil {
+					ragStore = store
+					log.Println("RAG Vector Store initialized in Worker Pool")
+				} else {
+					log.Printf("Failed to init redisvector: %v", err)
+				}
 			}
 		}
 	} else {
@@ -133,6 +133,23 @@ func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) err
 	log.Printf("[Worker] Processing task %s (%s)", t.ID, t.Type)
 
 	systemPrompt := t.SystemPrompt
+	var modelName string
+
+	// 若任务关联了 Agent，则用 Agent 的持久化配置覆盖临时配置
+	if t.AgentID != "" {
+		if agent, ok := p.manager.GetAgent(t.AgentID); ok {
+			if agent.SystemPrompt != "" {
+				systemPrompt = agent.SystemPrompt
+			}
+			if agent.Model != "" {
+				modelName = agent.Model
+			}
+			log.Printf("[Worker] Task %s loaded agent config %s", t.ID, t.AgentID)
+		} else {
+			log.Printf("[Worker] Task %s agent %s not found, fallback to default", t.ID, t.AgentID)
+		}
+	}
+
 	if systemPrompt == "" {
 		systemPrompt = "你是一个有用的 AI 助手。请尽力解答用户的问题或完成用户指定的任务。"
 	}
@@ -224,7 +241,7 @@ func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) err
 	apiCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	result, err := p.llmClient.Generate(apiCtx, systemPrompt, historyMessages, t.Payload, p.mcpClient)
+	result, err := p.llmClient.GenerateWithModel(apiCtx, modelName, systemPrompt, historyMessages, t.Payload, p.mcpClient)
 
 	// 再次检查任务在请求 API 期间是否被取消
 	checkTask, ok := p.manager.GetTask(t.ID)

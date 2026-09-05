@@ -2,7 +2,6 @@ package api
 
 import (
 	"net/http"
-	"strings"
 
 	"gotaskai/internal/config"
 	"gotaskai/internal/pkg/kag"
@@ -119,9 +118,10 @@ func (h *RAGHandler) Ingest(c *gin.Context) {
 	}
 
 	// 4. 初始化 Redis 向量存储连接
-	redisURL := config.AppConfig.Redis.Addr
-	if !strings.HasPrefix(redisURL, "redis://") {
-		redisURL = "redis://" + redisURL
+	redisURL := config.AppConfig.Redis.VectorStoreURL()
+	if redisURL == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "RedisVector 需要配置 redis.addr 直连地址"})
+		return
 	}
 
 	store, err := redisvector.New(

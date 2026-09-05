@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
 
 	"gotaskai/internal/config"
 
@@ -60,10 +59,9 @@ func main() {
 	fmt.Printf("智能切分完成，共 %d 个 Chunk\n", len(chunks))
 
 	// 5. 初始化 Redis 向量存储连接
-	// 注意这里添加 redis:// 前缀
-	redisURL := config.AppConfig.Redis.Addr
-	if !strings.HasPrefix(redisURL, "redis://") {
-		redisURL = "redis://" + redisURL
+	redisURL := config.AppConfig.Redis.VectorStoreURL()
+	if redisURL == "" {
+		log.Fatalf("RedisVector 需要配置 redis.addr 直连地址")
 	}
 
 	store, err := redisvector.New(

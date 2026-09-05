@@ -26,12 +26,32 @@ type TaskManager struct {
 
 // NewTaskManager 创建并初始化一个任务管理器
 func NewTaskManager(db *gorm.DB, rdb *redis.Client, redisOpt asynq.RedisConnOpt) *TaskManager {
-	return &TaskManager{
+	m := &TaskManager{
 		db:          db,
 		rdb:         rdb,
 		asynqClient: asynq.NewClient(redisOpt),
 		ctx:         context.Background(),
 		clients:     make(map[uint]map[chan *model.Task]bool),
+	}
+
+	// 微服务解耦：启动一个后台协程，监听 Redis Pub/Sub 的全局状态更新
+	go m.listenForGlobalUpdates()
+
+	return m
+}
+
+// listenForGlobalUpdates 监听来自 Redis 的跨进程任务更新事件
+func (m *TaskManager) listenForGlobalUpdates() {
+	pubsub := m.rdb.Subscribe(m.ctx, "global_task_updates")
+	defer pubsub.Close()
+
+	ch := pubsub.Channel()
+	for msg := range ch {
+		var t model.Task
+		if err := json.Unmarshal([]byte(msg.Payload), &t); err == nil {
+			// 将接收到的跨进程事件，广播给当前进程（如 API Server）挂载的所有本地 SSE 客户端
+			m.broadcast(&t)
+		}
 	}
 }
 
@@ -223,8 +243,14 @@ func (m *TaskManager) UpdateTask(t *model.Task) {
 	// 2. 更新 Redis 缓存
 	m.cacheTask(t)
 
-	// 3. 触发 SSE 广播，通知前端
-	m.broadcast(t)
+	// 3. 触发跨进程 SSE 广播通知 (微服务架构改造核心)
+	// 在单体架构中，我们直接调用 m.broadcast(t) 即可。
+	// 但现在 Worker 和 API 是两个独立的进程，前端是连在 API 上的，而干活更新状态的是 Worker。
+	// 所以 Worker 必须把更新事件发布到 Redis，由 API 监听后再推送给前端。
+	data, err := json.Marshal(t)
+	if err == nil {
+		m.rdb.Publish(m.ctx, "global_task_updates", data)
+	}
 }
 
 // DeleteTask 从系统中删除指定的任务
@@ -237,4 +263,68 @@ func (m *TaskManager) DeleteTask(id string) error {
 	// 2. 从 Redis 缓存中删除记录
 	m.rdb.Del(m.ctx, "task:"+id)
 	return nil
+}
+
+// GetAgent 根据 ID 获取 Agent 配置（Cache-Aside：先 Redis 后 MySQL）
+func (m *TaskManager) GetAgent(id string) (*model.Agent, bool) {
+	// 1. 尝试从 Redis 缓存获取
+	val, err := m.rdb.Get(m.ctx, "agent:"+id).Result()
+	if err == nil && val != "" {
+		var a model.Agent
+		if err := json.Unmarshal([]byte(val), &a); err == nil {
+			return &a, true
+		}
+	}
+
+	// 2. 缓存未命中，从 MySQL 获取
+	var a model.Agent
+	if err := m.db.Where("id = ?", id).First(&a).Error; err != nil {
+		return nil, false
+	}
+
+	// 3. 回写缓存
+	m.cacheAgent(&a)
+	return &a, true
+}
+
+// ListAgents 获取指定用户的全部 Agent
+func (m *TaskManager) ListAgents(userID uint) []*model.Agent {
+	var agents []*model.Agent
+	m.db.Where("user_id = ?", userID).Order("created_at desc").Find(&agents)
+	return agents
+}
+
+// CreateAgent 新建 Agent 并写缓存
+func (m *TaskManager) CreateAgent(a *model.Agent) error {
+	if err := m.db.Create(a).Error; err != nil {
+		return err
+	}
+	m.cacheAgent(a)
+	return nil
+}
+
+// UpdateAgent 更新 Agent 并失效缓存（实现配置热更新）
+func (m *TaskManager) UpdateAgent(a *model.Agent) error {
+	if err := m.db.Save(a).Error; err != nil {
+		return err
+	}
+	m.rdb.Del(m.ctx, "agent:"+a.ID)
+	return nil
+}
+
+// DeleteAgent 删除 Agent 并清除缓存
+func (m *TaskManager) DeleteAgent(id string) error {
+	if err := m.db.Where("id = ?", id).Delete(&model.Agent{}).Error; err != nil {
+		return err
+	}
+	m.rdb.Del(m.ctx, "agent:"+id)
+	return nil
+}
+
+// cacheAgent 将 Agent 配置写入 Redis 缓存（短 TTL，以便配置热更新及时生效）
+func (m *TaskManager) cacheAgent(a *model.Agent) {
+	data, err := json.Marshal(a)
+	if err == nil {
+		m.rdb.Set(m.ctx, "agent:"+a.ID, data, 5*time.Minute)
+	}
 }

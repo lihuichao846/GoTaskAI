@@ -5,7 +5,6 @@ import (
 	"gotaskai/internal/model"
 	"gotaskai/internal/pkg/jwt"
 	"gotaskai/internal/pkg/llm"
-	"gotaskai/internal/pkg/mcpclient"
 	"gotaskai/internal/queue"
 	"net/http"
 	"time"
@@ -18,15 +17,13 @@ import (
 type Handler struct {
 	manager   *queue.TaskManager // 依赖注入任务管理器
 	llmClient *llm.Client        // 大模型客户端用于同步的 prompt 优化
-	mcpClient *mcpclient.Wrapper // MCP 客户端用于联网搜索等工具
 }
 
 // NewHandler 创建 Handler 实例，注入依赖
-func NewHandler(manager *queue.TaskManager, mcpClient *mcpclient.Wrapper) *Handler {
+func NewHandler(manager *queue.TaskManager) *Handler {
 	return &Handler{
 		manager:   manager,
 		llmClient: llm.NewClient(),
-		mcpClient: mcpClient,
 	}
 }
 
@@ -58,6 +55,7 @@ func (h *Handler) BatchSubmitTasks(c *gin.Context) {
 			ID:           uuid.New().String(),
 			UserID:       userID,
 			SessionID:    taskReq.SessionID,
+			AgentID:      taskReq.AgentID,
 			Type:         taskReq.Type,
 			SystemPrompt: taskReq.SystemPrompt,
 			Priority:     taskReq.Priority,
@@ -94,6 +92,7 @@ func (h *Handler) BatchSubmitTasks(c *gin.Context) {
 type SubmitRequest struct {
 	Type         model.TaskType     `json:"type"`                       // 任务类型，默认为 custom
 	SessionID    string             `json:"session_id"`                 // 关联的会话ID（用于多轮对话上下文）
+	AgentID      string             `json:"agent_id"`                   // 关联的 Agent 配置 ID（可空）
 	SystemPrompt string             `json:"system_prompt"`              // AI 角色设定/系统提示词
 	Payload      string             `json:"payload" binding:"required"` // 任务的具体载荷/输入数据
 	Priority     model.TaskPriority `json:"priority"`                   // 任务优先级 (1:低, 2:普通, 3:高)
@@ -118,7 +117,8 @@ func (h *Handler) OptimizePrompt(c *gin.Context) {
 	defer cancel()
 
 	// 优化 prompt 只是一个单轮请求，不需要历史记录，允许使用联网工具获取最新背景信息
-	optimizedPrompt, err := h.llmClient.Generate(ctx, systemPrompt, nil, req.Prompt, h.mcpClient)
+	// 调用大模型进行润色，API 层面无需传入 MCP 客户端
+	optimizedPrompt, err := h.llmClient.Generate(ctx, systemPrompt, nil, req.Prompt, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to optimize prompt: " + err.Error()})
 		return
@@ -154,6 +154,7 @@ func (h *Handler) SubmitTask(c *gin.Context) {
 		ID:           uuid.New().String(), // 使用 UUID 保证任务 ID 的全局唯一性
 		UserID:       userID,              // 绑定任务与用户的关系
 		SessionID:    req.SessionID,
+		AgentID:      req.AgentID,
 		Type:         req.Type,
 		SystemPrompt: req.SystemPrompt,
 		Priority:     req.Priority, // 设置任务优先级
@@ -334,12 +335,13 @@ func (h *Handler) CancelTask(c *gin.Context) {
 		return
 	}
 
-	// 将状态标记为 cancelled
+	// 多个 Worker 进程共享同一个 Redis/MySQL 状态源，直接标记为 cancelled 即可。
+	// 正在执行中的任务会在关键阶段检查取消状态，避免把最终结果回写为 completed。
 	task.Status = model.StatusCancelled
 	task.Error = "Task was cancelled by user"
 	h.manager.UpdateTask(task)
 
-	c.JSON(http.StatusOK, gin.H{"message": "任务已取消"})
+	c.JSON(http.StatusOK, gin.H{"message": "任务已标记为取消"})
 }
 
 // StreamTasks 处理 GET /api/tasks/stream 请求，建立 SSE 长连接

@@ -34,6 +34,7 @@ type Task struct {
 	ID           string       `json:"id" gorm:"primaryKey;type:varchar(36)"`    // 任务的全局唯一标识符 (UUID)
 	UserID       uint         `json:"user_id" gorm:"index"`                     // 归属的用户 ID
 	SessionID    string       `json:"session_id" gorm:"index;type:varchar(50)"` // 所属会话ID，用于关联上下文
+	AgentID      string       `json:"agent_id" gorm:"index;type:varchar(36)"`   // 关联的 Agent 配置 ID（可空）
 	Type         TaskType     `json:"type" gorm:"type:varchar(50)"`             // 任务类型
 	SystemPrompt string       `json:"system_prompt" gorm:"type:text"`           // AI 的系统角色设定 (可选)
 	Priority     TaskPriority `json:"priority" gorm:"type:int;default:2"`       // 任务优先级 (1:低, 2:普通, 3:高)

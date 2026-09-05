@@ -79,6 +79,14 @@ func mcpToolToOpenAITool(t mcp.Tool) openai.Tool {
 
 // Generate 调用大模型生成文本回复，支持传入多轮历史对话上下文，并支持可选的 MCP 客户端用于工具调用
 func (c *Client) Generate(ctx context.Context, systemPrompt string, history []openai.ChatCompletionMessage, userPrompt string, mcpClient *mcpclient.Wrapper) (string, error) {
+	return c.GenerateWithModel(ctx, c.model, systemPrompt, history, userPrompt, mcpClient)
+}
+
+// GenerateWithModel 与 Generate 相同，但允许指定模型（model 为空时回退到默认模型）
+func (c *Client) GenerateWithModel(ctx context.Context, model string, systemPrompt string, history []openai.ChatCompletionMessage, userPrompt string, mcpClient *mcpclient.Wrapper) (string, error) {
+	if model == "" {
+		model = c.model
+	}
 	messages := make([]openai.ChatCompletionMessage, 0, len(history)+2)
 
 	// 1. 添加 System Prompt
@@ -114,7 +122,7 @@ func (c *Client) Generate(ctx context.Context, systemPrompt string, history []op
 
 	for {
 		req := openai.ChatCompletionRequest{
-			Model:    c.model,
+			Model:    model,
 			Messages: messages,
 		}
 

@@ -492,6 +492,8 @@
 
     <script>
         const { createApp, ref, computed, onMounted, onUnmounted } = Vue;
+        const API_BASE = window.__GOTASKAI_API_BASE__ || '';
+        const apiUrl = (path) => `${API_BASE}${path}`;
 
         createApp({
             setup() {
@@ -690,7 +692,7 @@
                         ...options.headers,
                         'Authorization': `Bearer ${authToken.value}`
                     };
-                    const response = await fetch(url, { ...options, headers });
+                    const response = await fetch(apiUrl(url), { ...options, headers });
                     if (response.status === 401) {
                         logout(); // Token 过期或无效时自动登出
                         alert('登录已过期，请重新登录');
@@ -705,7 +707,7 @@
                     }
                     if (!authToken.value) return;
 
-                    sseEventSource = new EventSource(`/api/tasks/stream?token=${authToken.value}`);
+                    sseEventSource = new EventSource(apiUrl(`/api/tasks/stream?token=${authToken.value}`));
 
                     sseEventSource.addEventListener('task_update', (event) => {
                         const updatedTask = JSON.parse(event.data);
@@ -743,7 +745,7 @@
                     isAuthSubmitting.value = true;
                     const endpoint = isLoginMode.value ? '/api/auth/login' : '/api/auth/register';
                     try {
-                        const res = await fetch(endpoint, {
+                        const res = await fetch(apiUrl(endpoint), {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify(authForm.value)
