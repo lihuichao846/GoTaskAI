@@ -111,55 +111,75 @@ services:
       gotaskai_net:
         ipv4_address: 172.28.0.30
 
-  api:
-    image: golang:1.25
-    container_name: gotaskai_api
-    working_dir: /app
-    command: ["sh", "-c", "go run ./cmd/api"]
-    ports:
-      - "8080:8080"
+  etcd:
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/quay.io/coreos/etcd:v3.5.5
+    container_name: gotaskai_etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     volumes:
-      - ./:/app
-      - ./config/config.docker.yaml:/app/config/config.yaml:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    depends_on:
-      - mysql
-      - redis
-      - redis_replica_1
-      - redis_replica_2
-      - redis_sentinel_1
-      - redis_sentinel_2
-      - redis_sentinel_3
-      - neo4j
+      - etcd_data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
     networks:
       gotaskai_net:
-        ipv4_address: 172.28.0.31
+        ipv4_address: 172.28.0.50
 
-  worker:
-    image: golang:1.25
-    container_name: gotaskai_worker
-    working_dir: /app
-    command: ["sh", "-c", "go run ./cmd/worker"]
+  minio:
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: gotaskai_minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data
     ports:
-      - "50051:50051"
+      - "9000:9000"
+      - "9001:9001"
     volumes:
-      - ./:/app
-      - ./config/config.docker.yaml:/app/config/config.yaml:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    depends_on:
-      - mysql
-      - redis
-      - redis_replica_1
-      - redis_replica_2
-      - redis_sentinel_1
-      - redis_sentinel_2
-      - redis_sentinel_3
-      - neo4j
+      - minio_data:/minio_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
     networks:
       gotaskai_net:
-        ipv4_address: 172.28.0.32
+        ipv4_address: 172.28.0.51
+
+  milvus:
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/milvusdb/milvus:v2.4.4
+    container_name: gotaskai_milvus
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    networks:
+      gotaskai_net:
+        ipv4_address: 172.28.0.52
 
   nginx:
     image: nginx:latest
@@ -175,7 +195,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - api
       - mysql
       - redis
       - redis_sentinel_1
@@ -192,6 +211,9 @@ volumes:
   redis_replica_1_data:
   redis_replica_2_data:
   neo4j_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
 
 networks:
   gotaskai_net:
