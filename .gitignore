@@ -1,0 +1,24 @@
+# 二进制构建产物
+*.exe
+*.exe~
+*.o
+*.a
+*.so
+*.dll
+*.dylib
+*.test
+*.out
+
+# 日志
+*.log
+
+# 临时文件
+temp/
+
+# 数据集与打包垃圾
+data/qangaroo_v1.1/
+data/__MACOSX/
+
+# 系统文件
+.DS_Store
+Thumbs.db
