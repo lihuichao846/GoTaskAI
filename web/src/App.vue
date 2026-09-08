@@ -3,63 +3,67 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import BackendProbe from './components/BackendProbe.vue'
 import AuthPanel from './components/AuthPanel.vue'
 import AgentPanel from './components/AgentPanel.vue'
-import PlaceholderPanel from './components/PlaceholderPanel.vue'
+import ToolPanel from './components/ToolPanel.vue'
+import KnowledgeBasePanel from './components/KnowledgeBasePanel.vue'
 import {
-  batchSubmitTasks,
+  createConversation,
   createTaskStream,
-  deleteSession,
+  deleteConversation,
   getTaskStatus,
   getTasks,
+  listAgents,
+  listConversations,
   login,
   register,
-  submitTask
+  runAgent
 } from './api/client'
 import { apiBaseUrl } from './config/env'
 
-const legacyUrl = '/legacy.html'
 const tokenKey = 'gotaskai_token'
 const usernameKey = 'gotaskai_username'
-const defaultSystemPrompt = '你是一个乐于助人的 AI 助手。'
 
 const authToken = ref(localStorage.getItem(tokenKey) || '')
 const username = ref(localStorage.getItem(usernameKey) || '')
 const authLoading = ref(false)
-const tasksLoading = ref(false)
 const submitLoading = ref(false)
 const tasks = ref([])
 const message = ref('')
 const messageType = ref('info')
-const activeSessionId = ref('')
 const chatInput = ref('')
-const chatSystemPrompt = ref(defaultSystemPrompt)
 const chatMessagesRef = ref(null)
-const isBatchMode = ref(false)
+// 与某个 Agent 的独立大窗对话
+const chatModalAgentId = ref('')
+const chatModalInput = ref('')
+const chatModalRef = ref(null)
 const searchId = ref('')
 const searchLoading = ref(false)
 const searchResult = ref(null)
-const showChatModal = ref(false)
-const taskForm = ref({
-  type: 'chat',
-  priority: 2,
-  systemPrompt: defaultSystemPrompt,
-  payload: ''
-})
+const agents = ref([])
+const agentsLoading = ref(false)
+const selectedAgentId = ref('')
+const conversations = ref([])
+const toolEvents = ref([])
 let taskEventSource = null
 const activeView = ref('workspace')
 
-const taskTypeOptions = [
-  { label: '对话对话 (Chat)', value: 'chat' },
-  { label: '文本摘要 (Summary)', value: 'summary' },
-  { label: '内容生成 (Generation)', value: 'generation' },
-  { label: '图像分析 (OCR)', value: 'ocr' },
-  { label: '自定义任务 (Custom)', value: 'custom' }
+const navItems = [
+  { key: 'workspace', label: '工作台' },
+  { key: 'agents', label: 'Agent' },
+  { key: 'tools', label: '工具' },
+  { key: 'kb', label: '知识库' },
+  { key: 'tasks', label: '任务中心' }
 ]
 
-const priorityOptions = [
-  { label: '低优先级', value: 1 },
-  { label: '普通优先级 (默认)', value: 2 },
-  { label: '高优先级', value: 3 }
-]
+const viewMeta = computed(() => {
+  const meta = {
+    workspace: { title: '工作台', desc: '在对话中运行 Agent，实时跟踪任务状态与结果。' },
+    agents: { title: 'Agent', desc: '创建并配置可复用的智能体，统一管理提示词、模型与运行。' },
+    tools: { title: '工具', desc: '为 Agent 接入内置工具或 MCP 外部工具，赋予联网搜索、代码执行等能力。' },
+    kb: { title: '知识库', desc: '构建 RAG 向量库与 KAG 知识图谱，为 Agent 提供领域知识。' },
+    tasks: { title: '任务中心', desc: '按任务 ID 查询与浏览原始任务记录。' }
+  }
+  return meta[activeView.value] || meta.workspace
+})
 
 const isLoggedIn = computed(() => Boolean(authToken.value))
 
@@ -75,15 +79,6 @@ function createSessionId() {
     return crypto.randomUUID()
   }
   return `sess_${Date.now()}`
-}
-
-function normalizeTextPreview(text, fallback = '未命名对话') {
-  const normalized = String(text || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  if (!normalized) return fallback
-  return normalized.length > 30 ? `${normalized.slice(0, 30)}...` : normalized
 }
 
 const taskStats = computed(() => {
@@ -105,91 +100,58 @@ const taskStats = computed(() => {
   return summary
 })
 
-const latestTask = computed(() => tasks.value[0] || null)
-
-const taskGroups = computed(() =>
-  groupedConversations.value.map((conversation) => ({
-    ...conversation,
-    firstTask: conversation.tasks[0] || null,
-    latestResult: assistantStatusText(conversation.latestTask)
-  }))
+const selectedAgent = computed(() =>
+  agents.value.find((agent) => agent.id === selectedAgentId.value) || null
 )
 
-const groupedConversations = computed(() => {
-  const groups = new Map()
-
-  for (const task of tasks.value) {
-    const key = task.session_id || task.id
-    if (!groups.has(key)) {
-      groups.set(key, {
-        id: key,
-        tasks: [],
-        updatedAt: task.created_at,
-        latestTask: task,
-        title: normalizeTextPreview(task.payload, '新对话')
-      })
-    }
-
-    const group = groups.get(key)
-    group.tasks.push(task)
-
-    const currentCreatedAt = new Date(task.created_at).getTime()
-    const latestUpdatedAt = new Date(group.updatedAt).getTime()
-    if (!Number.isNaN(currentCreatedAt) && (Number.isNaN(latestUpdatedAt) || currentCreatedAt > latestUpdatedAt)) {
-      group.updatedAt = task.created_at
-      group.latestTask = task
+// 每个 Agent 对应的最新会话 ID（用于恢复多轮上下文）。
+const conversationByAgent = computed(() => {
+  const map = {}
+  for (const conv of conversations.value) {
+    if (conv.agent_id && !map[conv.agent_id]) {
+      map[conv.agent_id] = conv.id
     }
   }
-
-  return Array.from(groups.values())
-    .map((group) => {
-      const sortedTasks = [...group.tasks].sort(
-        (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-      )
-      return {
-        ...group,
-        tasks: sortedTasks,
-        title: normalizeTextPreview(sortedTasks[0]?.payload, '新对话')
-      }
-    })
-    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+  return map
 })
 
-const activeConversation = computed(() => {
-  if (!activeSessionId.value) return null
-  return groupedConversations.value.find((conversation) => conversation.id === activeSessionId.value) || null
-})
+const activeAgentTasks = computed(() =>
+  tasks.value
+    .filter((task) => task.agent_id === selectedAgentId.value)
+    .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+)
 
-const activeConversationTasks = computed(() => activeConversation.value?.tasks || [])
+const activeAgentTitle = computed(() => selectedAgent.value?.name || '选择一个 Agent')
 
-const activeConversationTitle = computed(() => {
-  if (activeConversation.value) return activeConversation.value.title
-  return activeSessionId.value.startsWith('new_') ? '新对话' : '选择一个对话'
-})
-
-const conversationSummary = computed(() => {
-  if (activeConversation.value) {
-    return `共 ${activeConversation.value.tasks.length} 条消息任务`
+const activeAgentSummary = computed(() => {
+  if (selectedAgent.value) {
+    const prompt = (selectedAgent.value.system_prompt || '').trim()
+    return prompt ? `${prompt.slice(0, 60)}${prompt.length > 60 ? '...' : ''}` : '该 Agent 暂无系统设定'
   }
-  if (groupedConversations.value.length === 0) {
-    return '当前还没有历史会话'
-  }
-  return '从左侧列表选择一个会话，或新建对话'
+  return agents.value.length > 0 ? '从左侧选择一个 Agent 开始对话' : '还没有 Agent，请先创建一个'
 })
+
+// 独立大窗对话相关计算
+const chatModalAgent = computed(
+  () => agents.value.find((agent) => agent.id === chatModalAgentId.value) || null
+)
+
+const chatModalTasks = computed(() =>
+  tasks.value
+    .filter((task) => task.agent_id === chatModalAgentId.value)
+    .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+)
+
+const chatModalTitle = computed(() => chatModalAgent.value?.name || '独立对话')
+
+const chatModalSummary = computed(() => {
+  const prompt = (chatModalAgent.value?.system_prompt || '').trim()
+  return prompt ? `${prompt.slice(0, 80)}${prompt.length > 80 ? '...' : ''}` : (chatModalAgent.value?.model || '默认模型')
+})
+
+const canSendChatModalMessage = computed(() => chatModalInput.value.trim().length > 0 && !submitLoading.value)
 
 const canSendMessage = computed(() => chatInput.value.trim().length > 0 && !submitLoading.value)
-
-const taskSubmitButtonText = computed(() => {
-  if (submitLoading.value) return isBatchMode.value ? '批量提交中...' : '提交中...'
-  return isBatchMode.value ? '批量提交任务' : '提交任务'
-})
-
-const workspaceSummaryItems = computed(() => [
-  { key: 'total', label: '总任务', value: taskStats.value.total },
-  { key: 'sessions', label: '会话数', value: groupedConversations.value.length },
-  { key: 'processing', label: '处理中', value: taskStats.value.processing },
-  { key: 'completed', label: '已完成', value: taskStats.value.completed }
-])
 
 function setMessage(text, type = 'info') {
   message.value = text
@@ -208,18 +170,13 @@ function clearAuth() {
   authToken.value = ''
   username.value = ''
   tasks.value = []
-  activeSessionId.value = ''
   chatInput.value = ''
-  chatSystemPrompt.value = defaultSystemPrompt
-  showChatModal.value = false
   searchId.value = ''
   searchResult.value = null
-  taskForm.value = {
-    type: 'chat',
-    priority: 2,
-    systemPrompt: defaultSystemPrompt,
-    payload: ''
-  }
+  agents.value = []
+  selectedAgentId.value = ''
+  conversations.value = []
+  toolEvents.value = []
   localStorage.removeItem(tokenKey)
   localStorage.removeItem(usernameKey)
 }
@@ -240,24 +197,14 @@ function closeTaskStream() {
   }
 }
 
-function applyConversationPrompt(sessionId) {
-  const conversation = groupedConversations.value.find((item) => item.id === sessionId)
-  const latestPrompt = conversation?.tasks?.[conversation.tasks.length - 1]?.system_prompt?.trim()
-  chatSystemPrompt.value = latestPrompt || defaultSystemPrompt
-}
-
-function startNewChat(options = {}) {
-  const { open = true } = options
-  activeSessionId.value = `new_${Date.now()}`
+function selectAgent(id) {
+  selectedAgentId.value = id
   chatInput.value = ''
-  chatSystemPrompt.value = defaultSystemPrompt
-  showChatModal.value = open
+  scrollChatToBottom()
 }
 
-function openConversation(sessionId) {
-  activeSessionId.value = sessionId
-  applyConversationPrompt(sessionId)
-  showChatModal.value = true
+function goCreateAgent() {
+  activeView.value = 'agents'
 }
 
 function scrollChatToBottom() {
@@ -284,6 +231,10 @@ function assistantStatusText(task) {
   }
 }
 
+function toolEventsForTask(taskId) {
+  return toolEvents.value.filter((ev) => ev.task_id === taskId)
+}
+
 function initTaskStream() {
   closeTaskStream()
   if (!authToken.value) return
@@ -294,11 +245,19 @@ function initTaskStream() {
     try {
       const updatedTask = JSON.parse(event.data)
       upsertTask(updatedTask)
-      const sessionKey = updatedTask.session_id || updatedTask.id
-      if (!activeSessionId.value) {
-        activeSessionId.value = sessionKey
+      if (updatedTask.agent_id === selectedAgentId.value) {
+        scrollChatToBottom()
       }
-      if (sessionKey === activeSessionId.value) {
+    } catch {
+      // ignore malformed payload
+    }
+  })
+
+  taskEventSource.addEventListener('tool_call', (event) => {
+    try {
+      const ev = JSON.parse(event.data)
+      toolEvents.value.push(ev)
+      if (ev.agent_id === selectedAgentId.value) {
         scrollChatToBottom()
       }
     } catch {
@@ -319,7 +278,6 @@ function initTaskStream() {
 async function refreshTasks() {
   if (!authToken.value) return
 
-  tasksLoading.value = true
   try {
     const data = await getTasks(authToken.value)
     tasks.value = Array.isArray(data) ? data : []
@@ -331,8 +289,91 @@ async function refreshTasks() {
     } else {
       setMessage(`任务列表拉取失败：${error.message}`, 'error')
     }
+  }
+}
+
+async function refreshAgents() {
+  if (!authToken.value) return
+
+  agentsLoading.value = true
+  try {
+    const data = await listAgents(authToken.value)
+    agents.value = Array.isArray(data) ? data : []
+    if (!selectedAgentId.value && agents.value.length > 0) {
+      selectedAgentId.value = agents.value[0].id
+    }
+  } catch (error) {
+    setMessage(`Agent 列表加载失败：${error.message}`, 'error')
   } finally {
-    tasksLoading.value = false
+    agentsLoading.value = false
+  }
+}
+
+async function refreshConversations() {
+  if (!authToken.value) return
+  try {
+    const data = await listConversations(authToken.value)
+    conversations.value = Array.isArray(data) ? data : []
+  } catch {
+    // 会话列表非关键路径，失败时静默忽略
+  }
+}
+
+// 获取或创建指定 Agent 的会话 ID（优先复用已有会话）。
+async function getOrCreateConversationId(agentId) {
+  const existing = conversationByAgent.value[agentId]
+  if (existing) return existing
+
+  try {
+    const data = await createConversation(authToken.value, { agent_id: agentId })
+    const id = data?.conversation?.id || ''
+    await refreshConversations()
+    return id
+  } catch {
+    // 会话接口异常时回退到本地生成，后端会以其作为会话 ID 复用。
+    return createSessionId()
+  }
+}
+
+// 返回指定 Agent 当前会话的标题（用于展示）。
+function conversationTitle(agentId) {
+  const convId = conversationByAgent.value[agentId]
+  if (!convId) return ''
+  const conv = conversations.value.find((c) => c.id === convId)
+  return conv?.title || ''
+}
+
+// 为当前 Agent 新建一个空会话。
+async function newConversation() {
+  if (!selectedAgentId.value) {
+    setMessage('请先选择一个 Agent', 'error')
+    return
+  }
+  try {
+    const data = await createConversation(authToken.value, { agent_id: selectedAgentId.value })
+    await refreshConversations()
+    const ok = Boolean(data?.conversation?.id)
+    setMessage(ok ? '已新建会话' : '新建会话失败', ok ? 'success' : 'error')
+  } catch (error) {
+    setMessage(`新建会话失败：${error.message}`, 'error')
+  }
+}
+
+// 删除当前 Agent 的当前会话。
+async function removeCurrentConversation() {
+  if (!selectedAgentId.value) return
+  const convId = conversationByAgent.value[selectedAgentId.value]
+  if (!convId) {
+    setMessage('当前没有可删除的会话', 'error')
+    return
+  }
+  if (!window.confirm('确定删除当前会话吗？此操作不会删除已产生的任务记录。')) return
+  try {
+    await deleteConversation(authToken.value, convId)
+    await refreshConversations()
+    setMessage('会话已删除', 'success')
+  } catch (error) {
+    setMessage(`删除会话失败：${error.message}`, 'error')
   }
 }
 
@@ -344,6 +385,8 @@ async function handleLogin(payload) {
     initTaskStream()
     setMessage(`登录成功，欢迎你 ${data.username}`, 'success')
     await refreshTasks()
+    await refreshAgents()
+    await refreshConversations()
   } catch (error) {
     setMessage(`登录失败：${error.message}`, 'error')
   } finally {
@@ -371,105 +414,76 @@ function handleLogout() {
 function handleAgentRun() {
   activeView.value = 'workspace'
   refreshTasks()
+  refreshAgents()
 }
 
-async function handleDeleteConversation(sessionId) {
-  if (!authToken.value || !sessionId || sessionId.startsWith('new_')) return
-  if (!window.confirm('确定要删除这个对话及其全部历史消息吗？')) return
-
-  try {
-    await deleteSession(authToken.value, sessionId)
-    tasks.value = tasks.value.filter((task) => (task.session_id || task.id) !== sessionId)
-    if (activeSessionId.value === sessionId) {
-      startNewChat()
-    }
-    setMessage('对话已删除', 'success')
-  } catch (error) {
-    setMessage(`删除对话失败：${error.message}`, 'error')
-  }
-}
-
-async function handleChatSubmit() {
-  if (!authToken.value) return
+async function handleAgentChatSubmit() {
+  if (!authToken.value || !selectedAgentId.value) return
   const content = chatInput.value.trim()
   if (!content) return
 
-  let sessionId = activeSessionId.value
-  if (!sessionId || sessionId.startsWith('new_')) {
-    sessionId = createSessionId()
-    activeSessionId.value = sessionId
-  }
+  const sessionId = await getOrCreateConversationId(selectedAgentId.value)
 
   submitLoading.value = true
   try {
-    const data = await submitTask(authToken.value, {
-      type: 'chat',
-      priority: 2,
+    const data = await runAgent(authToken.value, selectedAgentId.value, {
+      payload: content,
       session_id: sessionId,
-      system_prompt: chatSystemPrompt.value.trim() || defaultSystemPrompt,
-      payload: content
+      priority: 2
     })
     chatInput.value = ''
-    setMessage(`任务已提交，状态：${data.status}，ID：${data.id}`, 'success')
+    setMessage(`已发送给 Agent，任务 ID：${data.id}`, 'success')
     await refreshTasks()
+    await refreshConversations()
     scrollChatToBottom()
   } catch (error) {
-    setMessage(`任务提交失败：${error.message}`, 'error')
+    setMessage(`发送失败：${error.message}`, 'error')
   } finally {
     submitLoading.value = false
   }
 }
 
-function splitBatchPayload(raw) {
-  return String(raw || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
+function openChatModal(agentId) {
+  chatModalAgentId.value = agentId
+  chatModalInput.value = ''
+  nextTick(() => scrollChatModalToBottom())
 }
 
-async function handleTaskSubmit() {
-  if (!authToken.value) return
-  const payloadText = taskForm.value.payload.trim()
-  if (!payloadText) {
-    setMessage('请输入任务内容', 'error')
-    return
-  }
+function closeChatModal() {
+  chatModalAgentId.value = ''
+  chatModalInput.value = ''
+}
+
+function scrollChatModalToBottom() {
+  nextTick(() => {
+    const container = chatModalRef.value
+    if (container) {
+      container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' })
+    }
+  })
+}
+
+async function handleChatModalSubmit() {
+  const agentId = chatModalAgentId.value
+  if (!authToken.value || !agentId) return
+  const content = chatModalInput.value.trim()
+  if (!content) return
+
+  const sessionId = await getOrCreateConversationId(agentId)
 
   submitLoading.value = true
   try {
-    if (isBatchMode.value) {
-      const payloads = splitBatchPayload(payloadText)
-      if (payloads.length === 0) {
-        setMessage('批量模式下请至少输入一条任务内容', 'error')
-        return
-      }
-
-      const data = await batchSubmitTasks(authToken.value, {
-        tasks: payloads.map((payload) => ({
-          type: taskForm.value.type,
-          priority: Number(taskForm.value.priority) || 2,
-          system_prompt: taskForm.value.systemPrompt.trim() || defaultSystemPrompt,
-          payload
-        }))
-      })
-
-      taskForm.value.payload = ''
-      setMessage(data?.message || `批量任务已提交，共 ${payloads.length} 条`, 'success')
-    } else {
-      const data = await submitTask(authToken.value, {
-        type: taskForm.value.type,
-        priority: Number(taskForm.value.priority) || 2,
-        system_prompt: taskForm.value.systemPrompt.trim() || defaultSystemPrompt,
-        payload: payloadText
-      })
-
-      taskForm.value.payload = ''
-      setMessage(`任务已提交，状态：${data.status}，ID：${data.id}`, 'success')
-    }
-
+    const data = await runAgent(authToken.value, agentId, {
+      payload: content,
+      session_id: sessionId,
+      priority: 2
+    })
+    chatModalInput.value = ''
     await refreshTasks()
+    await refreshConversations()
+    scrollChatModalToBottom()
   } catch (error) {
-    setMessage(`${isBatchMode.value ? '批量提交失败' : '任务提交失败'}：${error.message}`, 'error')
+    setMessage(`发送失败：${error.message}`, 'error')
   } finally {
     submitLoading.value = false
   }
@@ -494,42 +508,19 @@ async function handleSearchTask() {
   }
 }
 
-function closeChatModal() {
-  showChatModal.value = false
-}
-
 watch(
-  groupedConversations,
-  (conversations) => {
-    if (!isLoggedIn.value) return
-
-    if (conversations.length === 0) {
-      if (!activeSessionId.value) {
-        startNewChat()
-      }
-      return
-    }
-
-    if (!activeSessionId.value || activeSessionId.value.startsWith('new_')) {
-      if (activeSessionId.value.startsWith('new_')) return
-      activeSessionId.value = conversations[0].id
-      applyConversationPrompt(conversations[0].id)
-      return
-    }
-
-    const exists = conversations.some((conversation) => conversation.id === activeSessionId.value)
-    if (!exists) {
-      activeSessionId.value = conversations[0].id
-      applyConversationPrompt(conversations[0].id)
-    }
-  },
-  { immediate: true }
+  () => [selectedAgentId.value, activeAgentTasks.value.length],
+  () => {
+    scrollChatToBottom()
+  }
 )
 
 watch(
-  () => [activeSessionId.value, activeConversationTasks.value.length],
+  () => [chatModalAgentId.value, chatModalTasks.value.length],
   () => {
-    scrollChatToBottom()
+    if (chatModalAgentId.value) {
+      scrollChatModalToBottom()
+    }
   }
 )
 
@@ -537,8 +528,8 @@ onMounted(() => {
   if (authToken.value) {
     initTaskStream()
     refreshTasks()
-  } else {
-    startNewChat({ open: false })
+    refreshAgents()
+    refreshConversations()
   }
 })
 
@@ -559,10 +550,7 @@ onUnmounted(() => {
           </p>
 
           <div class="cta-row">
-            <a class="primary-btn" :href="legacyUrl" target="_blank" rel="noreferrer">
-              打开旧版页面
-            </a>
-            <a class="secondary-btn" :href="`${apiBaseUrl}/admin/tasks`" target="_blank" rel="noreferrer">
+            <a class="primary-btn" :href="`${apiBaseUrl}/admin/tasks`" target="_blank" rel="noreferrer">
               打开 Asynq 面板
             </a>
           </div>
@@ -587,7 +575,7 @@ onUnmounted(() => {
             </div>
           </div>
           <p class="hint">
-            当前页面只作用于 `web/` 独立前端工程，旧版静态页面入口仍保持不变。
+            当前页面作用于 `web/` 独立前端工程，登录后会自动建立 SSE 长连接并实时更新任务状态。
           </p>
         </section>
       </section>
@@ -626,351 +614,350 @@ onUnmounted(() => {
       </section>
 
       <template v-else>
-        <header class="workspace-header">
-          <div class="workspace-title">
-            <h1>GoTaskAI Agent 平台</h1>
-            <p>构建、配置并运行你的 AI Agent，统一管理工具调用、知识库与任务调度。</p>
-          </div>
-          <div class="workspace-toolbar">
-            <button class="toolbar-link" @click="startNewChat">新建对话</button>
-            <a class="toolbar-link" :href="legacyUrl" target="_blank" rel="noreferrer">旧版页面</a>
-            <a class="toolbar-link" :href="`${apiBaseUrl}/admin/tasks`" target="_blank" rel="noreferrer">Asynq 面板</a>
-            <span class="toolbar-user">你好, {{ username }}</span>
-            <button class="toolbar-logout" @click="handleLogout">退出登录</button>
-            <div class="service-status">
-              <span class="service-dot"></span>
-              服务运行中
+        <div class="app-shell">
+          <aside class="app-sidebar">
+            <div class="app-brand">
+              <div class="app-brand-mark">GT</div>
+              <div class="app-brand-text">
+                <strong>GoTaskAI</strong>
+                <span>Agent 平台</span>
+              </div>
             </div>
-          </div>
-        </header>
 
-        <nav class="view-tabs">
-          <button
-            class="view-tab"
-            :class="{ 'view-tab-active': activeView === 'workspace' }"
-            @click="activeView = 'workspace'"
-          >工作台</button>
-          <button
-            class="view-tab"
-            :class="{ 'view-tab-active': activeView === 'agents' }"
-            @click="activeView = 'agents'"
-          >Agent</button>
-          <button
-            class="view-tab"
-            :class="{ 'view-tab-active': activeView === 'tools' }"
-            @click="activeView = 'tools'"
-          >工具</button>
-          <button
-            class="view-tab"
-            :class="{ 'view-tab-active': activeView === 'kb' }"
-            @click="activeView = 'kb'"
-          >知识库</button>
-        </nav>
+            <nav class="app-nav">
+              <button
+                v-for="item in navItems"
+                :key="item.key"
+                type="button"
+                class="app-nav-item"
+                :class="{ 'app-nav-item-active': activeView === item.key }"
+                @click="activeView = item.key"
+              >
+                <span class="app-nav-dot"></span>
+                <span>{{ item.label }}</span>
+              </button>
+            </nav>
 
-        <template v-if="activeView === 'workspace'">
-        <section class="workspace-overview">
-          <div v-for="item in workspaceSummaryItems" :key="item.key" class="overview-card">
-            <span>{{ item.label }}</span>
-            <strong>{{ item.value }}</strong>
-          </div>
-        </section>
-
-        <section class="legacy-layout-shell">
-          <aside class="legacy-side-column">
-            <section class="card form-panel">
-              <div class="panel-head">
-                <div class="panel-title-block">
-                  <h2>{{ isBatchMode ? '批量提交任务' : '提交新任务' }}</h2>
-                  <p>{{ isBatchMode ? '每行一条内容，适合批量入队处理。' : '从左侧快速创建新任务并进入调度队列。' }}</p>
-                </div>
-                <button
-                  class="batch-toggle"
-                  type="button"
-                  :class="{ 'batch-toggle-active': isBatchMode }"
-                  @click="isBatchMode = !isBatchMode"
-                >
-                  <span>批量模式</span>
-                  <span class="batch-toggle-track">
-                    <span class="batch-toggle-thumb"></span>
-                  </span>
-                </button>
+            <div class="app-sidebar-foot">
+              <div class="service-status">
+                <span class="service-dot"></span>
+                <span>服务运行中</span>
               </div>
-
-              <form class="task-submit-form" @submit.prevent="handleTaskSubmit">
-                <label class="prompt-field">
-                  <span>任务类型</span>
-                  <select v-model="taskForm.type">
-                    <option v-for="option in taskTypeOptions" :key="option.value" :value="option.value">
-                      {{ option.label }}
-                    </option>
-                  </select>
-                </label>
-
-                <label class="prompt-field">
-                  <span>系统设定 (System Prompt)</span>
-                  <input
-                    v-model="taskForm.systemPrompt"
-                    type="text"
-                    placeholder="你是一个乐于助人的 AI 助手。"
-                  />
-                </label>
-
-                <label class="prompt-field">
-                  <span>请求内容 (Payload)</span>
-                  <textarea
-                    v-model="taskForm.payload"
-                    rows="7"
-                    :placeholder="isBatchMode ? '每行输入一条任务内容，将按多任务批量提交' : '输入要处理的文本或对话内容'"
-                  />
-                </label>
-
-                <label class="prompt-field">
-                  <span>任务优先级</span>
-                  <select v-model="taskForm.priority">
-                    <option v-for="option in priorityOptions" :key="option.value" :value="option.value">
-                      {{ option.label }}
-                    </option>
-                  </select>
-                </label>
-
-                <button class="primary-btn submit-task-btn" type="submit" :disabled="submitLoading">
-                  {{ taskSubmitButtonText }}
-                </button>
-              </form>
-            </section>
-
-            <section class="card query-panel">
-              <div class="panel-title-block panel-title-block-compact">
-                <h2>精确查询</h2>
-                <p>按任务 ID 快速查看单个任务的处理状态与结果。</p>
+              <div class="app-user">
+                <div class="app-user-avatar">{{ username.slice(0, 1).toUpperCase() }}</div>
+                <div class="app-user-meta">
+                  <strong>{{ username }}</strong>
+                  <button type="button" @click="handleLogout">退出登录</button>
+                </div>
               </div>
-              <form class="task-search-form" @submit.prevent="handleSearchTask">
-                <label class="prompt-field">
-                  <span>任务 ID</span>
-                  <input
-                    v-model="searchId"
-                    type="text"
-                    placeholder="输入完整的 UUID"
-                  />
-                </label>
-
-                <button class="secondary-btn submit-task-btn" type="submit" :disabled="!searchId.trim() || searchLoading">
-                  {{ searchLoading ? '查询中...' : '查询状态' }}
-                </button>
-              </form>
-
-              <section v-if="searchResult" class="query-result-card">
-                <div class="query-result-row">
-                  <span>状态</span>
-                  <span class="status-pill" :class="`status-${searchResult.status || 'default'}`">
-                    {{ searchResult.status }}
-                  </span>
-                </div>
-                <div class="query-result-row">
-                  <span>类型</span>
-                  <strong>{{ searchResult.type || '-' }}</strong>
-                </div>
-                <div class="query-result-row">
-                  <span>重试</span>
-                  <strong>{{ searchResult.retries || 0 }}/{{ searchResult.max_retry || 0 }}</strong>
-                </div>
-                <div v-if="searchResult.result" class="query-result-text query-result-success">
-                  {{ searchResult.result }}
-                </div>
-                <div v-if="searchResult.error" class="query-result-text query-result-error">
-                  {{ searchResult.error }}
-                </div>
-                <button class="query-close-btn" type="button" @click="searchResult = null">关闭结果</button>
-              </section>
-            </section>
+            </div>
           </aside>
 
-          <section class="card task-board">
-            <div class="panel-head task-board-head">
-              <div class="panel-title-block">
-                <h2>任务列表</h2>
-                <p>按会话分组展示最新状态，支持继续对话、删除与结果快速查看。</p>
+          <div class="app-main">
+            <header class="app-topbar">
+              <div class="app-topbar-title">
+                <h1>{{ viewMeta.title }}</h1>
+                <p>{{ viewMeta.desc }}</p>
               </div>
-              <div class="task-board-tools">
-                <span class="board-meta">{{ groupedConversations.length }} 个会话</span>
-                <button class="refresh-link" type="button" @click="refreshTasks">
-                  手动刷新
-                </button>
+              <div class="app-topbar-actions">
+                <a class="app-topbar-link" :href="`${apiBaseUrl}/admin/tasks`" target="_blank" rel="noreferrer">Asynq 面板</a>
+                <button v-if="activeView === 'workspace'" type="button" class="primary-btn" @click="goCreateAgent">新建 Agent</button>
               </div>
-            </div>
+            </header>
 
-            <div v-if="tasksLoading && taskGroups.length === 0" class="empty-state">
-              正在加载任务列表...
-            </div>
+            <div class="app-content">
+              <!-- 工作台：内联对话 -->
+              <section v-if="activeView === 'workspace'" class="conversation-workspace">
+                <aside class="conv-list-panel">
+                  <button type="button" class="primary-btn conv-new-btn" @click="goCreateAgent">新建 Agent</button>
 
-            <div v-else-if="taskGroups.length === 0" class="empty-state">
-              暂无任务，请在左侧提交
-            </div>
-
-            <div v-else class="task-group-list">
-              <article
-                v-for="conversation in taskGroups"
-                :key="conversation.id"
-                class="task-session-card"
-              >
-                <div class="task-session-head">
-                  <div class="task-session-title">
-                    <span class="task-session-id">{{ conversation.id.slice(0, 8) }}...</span>
-                    <strong>{{ conversation.latestTask.type || 'chat' }}</strong>
-                    <span class="session-count-chip">对话数: {{ conversation.tasks.length }}</span>
-                  </div>
-                  <div class="task-session-actions">
-                    <span class="status-pill" :class="`status-${conversation.latestTask.status || 'default'}`">
-                      {{ conversation.latestTask.status }}
-                    </span>
-                    <button class="continue-btn" type="button" @click="openConversation(conversation.id)">
-                      继续对话
-                    </button>
-                    <button class="icon-delete-btn" type="button" @click="handleDeleteConversation(conversation.id)">
-                      删除
-                    </button>
-                  </div>
-                </div>
-
-                <div class="task-preview-block">
-                  <strong>首次输入:</strong>
-                  <p>{{ conversation.firstTask?.payload || '-' }}</p>
-                </div>
-
-                <div
-                  class="task-preview-block task-preview-result"
-                  :class="{
-                    'task-preview-pending': conversation.latestTask.status === 'pending' || conversation.latestTask.status === 'processing',
-                    'task-preview-error': conversation.latestTask.status === 'failed' || conversation.latestTask.status === 'cancelled'
-                  }"
-                >
-                  <strong>最新结果:</strong>
-                  <p>{{ conversation.latestResult || '等待生成回复...' }}</p>
-                </div>
-
-                <div class="task-session-foot">
-                  <span>最后更新: {{ formatTime(conversation.latestTask.updated_at || conversation.updatedAt) }}</span>
-                </div>
-              </article>
-            </div>
-          </section>
-        </section>
-        </template>
-
-        <AgentPanel
-          v-if="activeView === 'agents'"
-          :token="authToken"
-          @message="setMessage"
-          @agent-run="handleAgentRun"
-        />
-
-        <PlaceholderPanel
-          v-if="activeView === 'tools'"
-          title="工具管理"
-          description="为 Agent 接入内置工具或 MCP 外部工具，赋予联网搜索、代码执行等能力。"
-          :items="['联网搜索', '代码执行', '自定义 MCP 工具']"
-        />
-
-        <PlaceholderPanel
-          v-if="activeView === 'kb'"
-          title="知识库构建"
-          description="上传文档，构建 RAG 向量库与 KAG 知识图谱，为 Agent 提供领域知识。"
-          :items="['文档上传', 'RAG 向量化', 'KAG 图谱抽取']"
-        />
-
-        <section
-          v-if="showChatModal"
-          class="chat-dialog-backdrop"
-          @click.self="closeChatModal"
-        >
-          <div class="chat-dialog">
-            <section class="chat-main-panel">
-              <header class="chat-topbar">
-                <div>
-                  <h1>{{ activeConversationTitle }}</h1>
-                  <p>{{ conversationSummary }}</p>
-                </div>
-                <div class="chat-topbar-meta">
-                  <span class="topbar-chip">
-                    {{ activeSessionId && !activeSessionId.startsWith('new_') ? '连续对话中' : '新会话' }}
-                  </span>
-                  <span class="topbar-chip muted">
-                    {{ latestTask ? `最近更新 ${formatTime(latestTask.updated_at || latestTask.created_at)}` : '等待开始' }}
-                  </span>
-                  <button class="chat-close-btn" type="button" @click="closeChatModal">关闭</button>
-                </div>
-              </header>
-
-              <div ref="chatMessagesRef" class="chat-messages chat-messages-panel">
-                <template v-if="activeConversationTasks.length > 0">
-                  <div
-                    v-for="task in activeConversationTasks"
-                    :key="task.id"
-                    class="chat-turn"
-                  >
-                    <article class="chat-bubble chat-bubble-user">
-                      <div class="chat-meta">
-                        <strong>我</strong>
-                        <span>{{ formatTime(task.created_at) }}</span>
-                      </div>
-                      <p>{{ task.payload || '-' }}</p>
-                    </article>
-
-                    <article
-                      class="chat-bubble chat-bubble-assistant"
-                      :class="{
-                        'chat-bubble-pending': task.status === 'pending' || task.status === 'processing',
-                        'chat-bubble-error': task.status === 'failed' || task.status === 'cancelled'
-                      }"
+                  <div class="conv-list">
+                    <div
+                      v-for="agent in agents"
+                      :key="agent.id"
+                      class="conv-item"
+                      :class="{ 'conv-item-active': agent.id === selectedAgentId }"
                     >
-                      <div class="chat-meta">
-                        <strong>GoTaskAI</strong>
-                        <span>{{ task.status }}</span>
+                      <button type="button" class="conv-item-main" @click="selectAgent(agent.id)">
+                        <strong>{{ agent.name }}</strong>
+                        <span>{{ conversationTitle(agent.id) || agent.model || '默认模型' }}</span>
+                      </button>
+                      <div class="conv-item-side">
+                        <span class="status-pill status-completed">{{ agent.status || 'active' }}</span>
+                        <button type="button" class="chat-modal-open-btn" @click="openChatModal(agent.id)">独立对话</button>
                       </div>
-                      <p>{{ assistantStatusText(task) || '等待生成回复...' }}</p>
-                    </article>
-                  </div>
-                </template>
+                    </div>
 
-                <div v-else class="chat-welcome">
-                  <div class="chat-welcome-inner">
-                    <div class="badge">New Chat</div>
-                    <h2>开始一段新的 AI 对话</h2>
-                    <p>输入第一条消息后，后续内容会自动归到同一个会话窗口。</p>
+                    <div v-if="agentsLoading" class="conv-list-empty">正在加载 Agent...</div>
+                    <div v-else-if="agents.length === 0" class="conv-list-empty">暂无 Agent，点击上方新建</div>
+                  </div>
+
+                  <div class="conv-list-foot">
+                    <span>{{ agents.length }} 个 Agent</span>
+                    <span>{{ taskStats.completed }} 已完成任务</span>
+                  </div>
+                </aside>
+
+                <section class="conv-chat-panel">
+                  <header class="conv-chat-head">
+                    <div class="conv-chat-title">
+                      <h2>{{ activeAgentTitle }}</h2>
+                      <p>{{ activeAgentSummary }}</p>
+                    </div>
+                    <div class="conv-chat-actions">
+                      <button v-if="selectedAgent" type="button" class="secondary-btn" @click="newConversation">新对话</button>
+                      <button v-if="selectedAgent && conversationByAgent[selectedAgent.id]" type="button" class="secondary-btn" @click="removeCurrentConversation">删除会话</button>
+                      <button v-if="selectedAgent" type="button" class="secondary-btn" @click="openChatModal(selectedAgent.id)">独立窗口</button>
+                      <button v-if="selectedAgent" type="button" class="secondary-btn" @click="goCreateAgent">管理 Agent</button>
+                    </div>
+                  </header>
+
+                  <div ref="chatMessagesRef" class="chat-messages chat-messages-panel">
+                    <template v-if="activeAgentTasks.length > 0">
+                      <div v-for="task in activeAgentTasks" :key="task.id" class="chat-turn">
+                        <article class="chat-bubble chat-bubble-user">
+                          <div class="chat-meta">
+                            <strong>我</strong>
+                            <span>{{ formatTime(task.created_at) }}</span>
+                          </div>
+                          <p>{{ task.payload || '-' }}</p>
+                        </article>
+
+                        <article
+                          class="chat-bubble chat-bubble-assistant"
+                          :class="{
+                            'chat-bubble-pending': task.status === 'pending' || task.status === 'processing',
+                            'chat-bubble-error': task.status === 'failed' || task.status === 'cancelled'
+                          }"
+                        >
+                          <div class="chat-meta">
+                            <strong>{{ selectedAgent?.name || 'Agent' }}</strong>
+                            <span>{{ task.status }}</span>
+                          </div>
+                          <p>{{ assistantStatusText(task) || '等待生成回复...' }}</p>
+                        </article>
+
+                        <div v-if="toolEventsForTask(task.id).length" class="tool-trace">
+                          <div
+                            v-for="ev in toolEventsForTask(task.id)"
+                            :key="`${ev.task_id}-${ev.tool_name}-${ev.status}-${ev.timestamp}`"
+                            class="tool-trace-item"
+                          >
+                            <span class="tool-trace-status" :class="`tool-trace-${ev.status}`">{{ ev.status }}</span>
+                            <strong>{{ ev.tool_name }}</strong>
+                            <span v-if="ev.arguments" class="tool-trace-args">{{ ev.arguments }}</span>
+                            <span v-if="ev.status === 'success' && ev.result" class="tool-trace-result">{{ ev.result }}</span>
+                            <span v-if="ev.status === 'failed' && ev.error" class="tool-trace-error">{{ ev.error }}</span>
+                          </div>
+                        </div>
+                      </div>
+                    </template>
+
+                    <div v-else class="chat-welcome">
+                      <div class="chat-welcome-inner">
+                        <div class="badge">{{ selectedAgent ? 'Agent' : 'No Agent' }}</div>
+                        <h2>{{ selectedAgent ? `与「${selectedAgent.name}」对话` : '选择一个 Agent 开始' }}</h2>
+                        <p>{{ selectedAgent ? '发送消息后，任务会绑定到当前 Agent 并异步执行。' : '从左侧选择一个已搭建的智能体，或先创建一个。' }}</p>
+                      </div>
+                    </div>
+                  </div>
+
+                  <footer class="composer-panel">
+                    <form class="chat-composer ai-composer" @submit.prevent="handleAgentChatSubmit">
+                      <textarea
+                        v-model="chatInput"
+                        rows="2"
+                        :placeholder="selectedAgent ? `给 ${selectedAgent.name} 发送消息` : '请先选择一个 Agent'"
+                      />
+
+                      <div class="chat-composer-actions">
+                        <span class="hint composer-hint">
+                          {{ selectedAgent ? `当前 Agent：${selectedAgent.name}` : '尚未选择 Agent' }}
+                        </span>
+                        <button class="primary-btn composer-send-btn" type="submit" :disabled="!canSendMessage || !selectedAgent">
+                          {{ submitLoading ? '发送中...' : '发送' }}
+                        </button>
+                      </div>
+                    </form>
+                  </footer>
+                </section>
+              </section>
+
+              <!-- Agent -->
+              <AgentPanel
+                v-if="activeView === 'agents'"
+                :token="authToken"
+                @message="setMessage"
+                @agent-run="handleAgentRun"
+              />
+
+              <!-- 工具 -->
+              <ToolPanel
+                v-if="activeView === 'tools'"
+                :token="authToken"
+                @message="setMessage"
+              />
+
+              <!-- 知识库 -->
+              <KnowledgeBasePanel
+                v-if="activeView === 'kb'"
+                :token="authToken"
+                @message="setMessage"
+              />
+
+              <!-- 任务中心（弱化为原始任务查询） -->
+              <section v-if="activeView === 'tasks'" class="task-center">
+                <section class="card query-panel">
+                    <div class="panel-head">
+                      <div class="panel-title-block">
+                        <h2>原始任务查询</h2>
+                        <p>按任务 ID 快速查看单个任务的处理状态与结果。</p>
+                      </div>
+                    </div>
+                    <form class="task-search-form" @submit.prevent="handleSearchTask">
+                      <label class="prompt-field">
+                        <span>任务 ID</span>
+                        <input
+                          v-model="searchId"
+                          type="text"
+                          placeholder="输入完整的 UUID"
+                        />
+                      </label>
+
+                      <button class="secondary-btn submit-task-btn" type="submit" :disabled="!searchId.trim() || searchLoading">
+                        {{ searchLoading ? '查询中...' : '查询状态' }}
+                      </button>
+                    </form>
+
+                    <section v-if="searchResult" class="query-result-card">
+                      <div class="query-result-row">
+                        <span>状态</span>
+                        <span class="status-pill" :class="`status-${searchResult.status || 'default'}`">
+                          {{ searchResult.status }}
+                        </span>
+                      </div>
+                      <div class="query-result-row">
+                        <span>类型</span>
+                        <strong>{{ searchResult.type || '-' }}</strong>
+                      </div>
+                      <div class="query-result-row">
+                        <span>重试</span>
+                        <strong>{{ searchResult.retries || 0 }}/{{ searchResult.max_retry || 0 }}</strong>
+                      </div>
+                      <div v-if="searchResult.result" class="query-result-text query-result-success">
+                        {{ searchResult.result }}
+                      </div>
+                      <div v-if="searchResult.error" class="query-result-text query-result-error">
+                        {{ searchResult.error }}
+                      </div>
+                      <button class="query-close-btn" type="button" @click="searchResult = null">关闭结果</button>
+                    </section>
+                  </section>
+
+                  <section class="card task-list-panel">
+                    <div class="panel-head">
+                      <div class="panel-title-block">
+                        <h2>任务列表</h2>
+                        <p>共 {{ tasks.length }} 条原始任务记录。</p>
+                      </div>
+                    </div>
+                    <div v-if="tasks.length === 0" class="empty-state">暂无任务</div>
+                    <div v-else class="task-list">
+                      <div v-for="task in tasks" :key="task.id" class="task-list-item">
+                        <div class="task-list-item-main">
+                          <strong>{{ task.id }}</strong>
+                          <span>{{ task.type }} · {{ formatTime(task.created_at) }}</span>
+                        </div>
+                        <span class="status-pill" :class="`status-${task.status || 'default'}`">{{ task.status }}</span>
+                      </div>
+                    </div>
+                  </section>
+              </section>
+            </div>
+          </div>
+        </div>
+
+        <!-- 与某个 Agent 的独立宽大对话弹窗 -->
+        <div v-if="chatModalAgentId && chatModalAgent" class="chat-modal-overlay" @click.self="closeChatModal">
+          <div class="chat-modal">
+            <header class="chat-modal-head">
+              <div class="chat-modal-title">
+                <h2>{{ chatModalTitle }}</h2>
+                <p>{{ chatModalSummary }}</p>
+              </div>
+              <div class="chat-modal-tools">
+                <span class="status-pill status-completed">{{ chatModalAgent?.status || 'active' }}</span>
+                <button type="button" class="chat-modal-close" @click="closeChatModal">关闭</button>
+              </div>
+            </header>
+
+            <div ref="chatModalRef" class="chat-modal-body chat-messages">
+              <template v-if="chatModalTasks.length > 0">
+                <div v-for="task in chatModalTasks" :key="task.id" class="chat-turn">
+                  <article class="chat-bubble chat-bubble-user">
+                    <div class="chat-meta">
+                      <strong>我</strong>
+                      <span>{{ formatTime(task.created_at) }}</span>
+                    </div>
+                    <p>{{ task.payload || '-' }}</p>
+                  </article>
+
+                  <article
+                    class="chat-bubble chat-bubble-assistant"
+                    :class="{
+                      'chat-bubble-pending': task.status === 'pending' || task.status === 'processing',
+                      'chat-bubble-error': task.status === 'failed' || task.status === 'cancelled'
+                    }"
+                  >
+                    <div class="chat-meta">
+                      <strong>{{ chatModalAgent?.name || 'Agent' }}</strong>
+                      <span>{{ task.status }}</span>
+                    </div>
+                    <p>{{ assistantStatusText(task) || '等待生成回复...' }}</p>
+                  </article>
+
+                  <div v-if="toolEventsForTask(task.id).length" class="tool-trace">
+                    <div
+                      v-for="ev in toolEventsForTask(task.id)"
+                      :key="`${ev.task_id}-${ev.tool_name}-${ev.status}-${ev.timestamp}`"
+                      class="tool-trace-item"
+                    >
+                      <span class="tool-trace-status" :class="`tool-trace-${ev.status}`">{{ ev.status }}</span>
+                      <strong>{{ ev.tool_name }}</strong>
+                      <span v-if="ev.arguments" class="tool-trace-args">{{ ev.arguments }}</span>
+                      <span v-if="ev.status === 'success' && ev.result" class="tool-trace-result">{{ ev.result }}</span>
+                      <span v-if="ev.status === 'failed' && ev.error" class="tool-trace-error">{{ ev.error }}</span>
+                    </div>
                   </div>
                 </div>
+              </template>
+
+              <div v-else class="chat-welcome">
+                <div class="chat-welcome-inner">
+                  <div class="badge">Agent</div>
+                  <h2>与「{{ chatModalAgent?.name }}」开始对话</h2>
+                  <p>发送消息后，任务会绑定到当前 Agent 并异步执行。</p>
+                </div>
               </div>
+            </div>
 
-              <footer class="composer-panel">
-                <form class="chat-composer ai-composer" @submit.prevent="handleChatSubmit">
-                  <label class="prompt-field compact-prompt">
-                    <span>系统设定</span>
-                    <input
-                      v-model="chatSystemPrompt"
-                      type="text"
-                      placeholder="例如：你是一个严谨的 AI 架构助手"
-                    />
-                  </label>
-
-                  <textarea
-                    v-model="chatInput"
-                    rows="4"
-                    placeholder="给 GoTaskAI 发送消息"
-                  />
-
-                  <div class="chat-composer-actions">
-                    <span class="hint composer-hint">
-                      {{ activeSessionId && !activeSessionId.startsWith('new_') ? `当前会话 ID：${activeSessionId}` : '发送后会自动创建新会话 ID' }}
-                    </span>
-                    <button class="primary-btn composer-send-btn" type="submit" :disabled="!canSendMessage">
-                      {{ submitLoading ? '发送中...' : '发送' }}
-                    </button>
-                  </div>
-                </form>
-              </footer>
-            </section>
+            <footer class="chat-modal-foot">
+              <form class="chat-composer ai-composer" @submit.prevent="handleChatModalSubmit">
+                <textarea
+                  v-model="chatModalInput"
+                  rows="2"
+                  :placeholder="`给 ${chatModalAgent?.name} 发送消息`"
+                />
+                <div class="chat-composer-actions">
+                  <span class="hint composer-hint">独立对话窗口</span>
+                  <button class="primary-btn composer-send-btn" type="submit" :disabled="!canSendChatModalMessage">
+                    {{ submitLoading ? '发送中...' : '发送' }}
+                  </button>
+                </div>
+              </form>
+            </footer>
           </div>
-        </section>
+        </div>
       </template>
     </main>
   </div>

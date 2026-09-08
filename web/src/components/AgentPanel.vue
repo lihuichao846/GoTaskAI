@@ -1,9 +1,15 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import {
+  bindAgentKnowledgeBases,
+  bindAgentTools,
   createAgent,
   deleteAgent,
+  listAgentKnowledgeBases,
+  listAgentTools,
   listAgents,
+  listKnowledgeBases,
+  listTools,
   runAgent,
   updateAgent
 } from '../api/client'
@@ -17,9 +23,14 @@ const emit = defineEmits(['message', 'agent-run'])
 const agents = ref([])
 const loading = ref(false)
 const selectedId = ref('')
-const form = ref({ name: '', system_prompt: '', model: '' })
+const form = ref({ name: '', system_prompt: '', model: '', api_key: '', base_url: '' })
 const runPayload = ref('')
 const running = ref(false)
+
+const allTools = ref([])
+const allKbs = ref([])
+const boundToolIds = ref([])
+const boundKbIds = ref([])
 
 const selected = computed(() => agents.value.find((a) => a.id === selectedId.value) || null)
 const isNew = computed(() => !selectedId.value)
@@ -38,17 +49,53 @@ async function refresh() {
   }
 }
 
-function selectAgent(id) {
+async function loadOptions() {
+  try {
+    const [tools, kbs] = await Promise.all([
+      listTools(props.token),
+      listKnowledgeBases(props.token)
+    ])
+    allTools.value = tools || []
+    allKbs.value = kbs || []
+  } catch (e) {
+    emit('message', `加载工具/知识库失败：${e.message}`, 'error')
+  }
+}
+
+async function loadBindings(agentId) {
+  try {
+    const [tools, kbs] = await Promise.all([
+      listAgentTools(props.token, agentId),
+      listAgentKnowledgeBases(props.token, agentId)
+    ])
+    boundToolIds.value = (tools || []).map((t) => t.id)
+    boundKbIds.value = (kbs || []).map((k) => k.id)
+  } catch (e) {
+    boundToolIds.value = []
+    boundKbIds.value = []
+  }
+}
+
+async function selectAgent(id) {
   selectedId.value = id
   const a = agents.value.find((x) => x.id === id)
   if (a) {
-    form.value = { name: a.name, system_prompt: a.system_prompt || '', model: a.model || '' }
+    form.value = {
+      name: a.name,
+      system_prompt: a.system_prompt || '',
+      model: a.model || '',
+      api_key: a.api_key || '',
+      base_url: a.base_url || ''
+    }
+    await loadBindings(id)
   }
 }
 
 function newAgent() {
   selectedId.value = ''
-  form.value = { name: '', system_prompt: '', model: '' }
+  form.value = { name: '', system_prompt: '', model: '', api_key: '', base_url: '' }
+  boundToolIds.value = []
+  boundKbIds.value = []
 }
 
 async function save() {
@@ -57,14 +104,21 @@ async function save() {
     return
   }
   try {
+    let agentId = selectedId.value
     if (isNew.value) {
       const data = await createAgent(props.token, form.value)
-      selectedId.value = data?.agent?.id || ''
-      emit('message', 'Agent 创建成功', 'success')
+      agentId = data?.agent?.id || ''
+      selectedId.value = agentId
     } else {
       await updateAgent(props.token, selectedId.value, form.value)
-      emit('message', 'Agent 更新成功', 'success')
     }
+
+    if (agentId) {
+      await bindAgentTools(props.token, agentId, boundToolIds.value)
+      await bindAgentKnowledgeBases(props.token, agentId, boundKbIds.value)
+    }
+
+    emit('message', 'Agent 保存成功', 'success')
     await refresh()
   } catch (e) {
     emit('message', `保存失败：${e.message}`, 'error')
@@ -77,7 +131,9 @@ async function remove() {
   try {
     await deleteAgent(props.token, selected.value.id)
     selectedId.value = ''
-    form.value = { name: '', system_prompt: '', model: '' }
+    form.value = { name: '', system_prompt: '', model: '', api_key: '', base_url: '' }
+    boundToolIds.value = []
+    boundKbIds.value = []
     emit('message', 'Agent 已删除', 'success')
     await refresh()
   } catch (e) {
@@ -100,7 +156,10 @@ async function run() {
   }
 }
 
-onMounted(refresh)
+onMounted(async () => {
+  await loadOptions()
+  await refresh()
+})
 </script>
 
 <template>
@@ -108,7 +167,7 @@ onMounted(refresh)
     <div class="panel-head">
       <div class="panel-title-block">
         <h2>Agent 管理</h2>
-        <p>创建并配置可复用的智能体，运行后进入异步任务队列。</p>
+        <p>创建并配置智能体，绑定工具与知识库后运行进入异步任务队列。</p>
       </div>
       <button class="primary-btn" @click="newAgent">新建 Agent</button>
     </div>
@@ -145,11 +204,37 @@ onMounted(refresh)
             <span>模型（留空使用平台默认）</span>
             <input v-model="form.model" type="text" placeholder="例如：qwen2.5:latest" />
           </label>
+          <label>
+            <span>API Key（留空使用平台默认）</span>
+            <input v-model="form.api_key" type="password" placeholder="例如：sk-xxxxxxxx" autocomplete="off" />
+          </label>
+          <label>
+            <span>接口地址 Base URL（留空使用平台默认）</span>
+            <input v-model="form.base_url" type="text" placeholder="例如：https://api.openai.com/v1" />
+          </label>
 
           <div class="agent-actions">
             <button class="primary-btn" @click="save">{{ isNew ? '创建' : '保存' }}</button>
             <button v-if="!isNew" class="secondary-btn" @click="remove">删除</button>
           </div>
+        </div>
+
+        <div class="agent-bindings">
+          <h3>工具</h3>
+          <div v-if="allTools.length === 0" class="empty-state">暂无可用工具</div>
+          <label v-for="tool in allTools" :key="tool.id" class="bind-check">
+            <input type="checkbox" :value="tool.id" v-model="boundToolIds" />
+            <span>{{ tool.display_name || tool.name }}</span>
+            <em>{{ tool.is_builtin ? '内置' : '私有' }}</em>
+          </label>
+
+          <h3>知识库</h3>
+          <div v-if="allKbs.length === 0" class="empty-state">暂无知识库</div>
+          <label v-for="kb in allKbs" :key="kb.id" class="bind-check">
+            <input type="checkbox" :value="kb.id" v-model="boundKbIds" />
+            <span>{{ kb.name }}</span>
+            <em>{{ kb.type }}</em>
+          </label>
         </div>
 
         <div v-if="!isNew" class="agent-run">

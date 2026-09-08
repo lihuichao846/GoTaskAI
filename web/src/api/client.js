@@ -174,3 +174,181 @@ export async function runAgent(token, agentId, payload) {
     body: JSON.stringify(payload)
   })
 }
+
+// ===== 工具管理 =====
+
+export async function listTools(token) {
+  return apiRequest('/api/tools', {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` }
+  })
+}
+
+export async function createTool(token, payload) {
+  return apiRequest('/api/tools', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify(payload)
+  })
+}
+
+export async function deleteTool(token, toolId) {
+  return apiRequest(`/api/tools/${encodeURIComponent(toolId)}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` }
+  })
+}
+
+export async function updateTool(token, toolId, payload) {
+  return apiRequest(`/api/tools/${encodeURIComponent(toolId)}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify(payload)
+  })
+}
+
+export async function updateToolStatus(token, toolId, status) {
+  return apiRequest(`/api/tools/${encodeURIComponent(toolId)}/status`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify({ status })
+  })
+}
+
+export async function listToolAgents(token, toolId) {
+  return apiRequest(`/api/tools/${encodeURIComponent(toolId)}/agents`, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` }
+  })
+}
+
+export async function searchMCPServers(token, query) {
+  return apiRequest('/api/tools/search', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify({ query })
+  })
+}
+
+export async function testToolConnection(token, config) {
+  return apiRequest('/api/tools/test', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify({ config })
+  })
+}
+
+// ===== 会话管理 =====
+
+export async function listConversations(token) {
+  return apiRequest('/api/conversations', {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` }
+  })
+}
+
+export async function createConversation(token, payload) {
+  return apiRequest('/api/conversations', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify(payload)
+  })
+}
+
+export async function deleteConversation(token, conversationId) {
+  return apiRequest(`/api/conversations/${encodeURIComponent(conversationId)}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` }
+  })
+}
+
+// ===== 知识库管理 =====
+
+export async function listKnowledgeBases(token) {
+  return apiRequest('/api/knowledge-bases', {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` }
+  })
+}
+
+export async function createKnowledgeBase(token, payload) {
+  return apiRequest('/api/knowledge-bases', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify(payload)
+  })
+}
+
+export async function deleteKnowledgeBase(token, kbId) {
+  return apiRequest(`/api/knowledge-bases/${encodeURIComponent(kbId)}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` }
+  })
+}
+
+export async function addDocument(token, kbId, payload) {
+  return apiRequest(`/api/knowledge-bases/${encodeURIComponent(kbId)}/documents`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: payload
+  })
+}
+
+// ===== Agent 绑定关系 =====
+
+export async function bindAgentTools(token, agentId, toolIds) {
+  return apiRequest(`/api/agents/${encodeURIComponent(agentId)}/tools`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify({ tool_ids: toolIds })
+  })
+}
+
+export async function listAgentTools(token, agentId) {
+  return apiRequest(`/api/agents/${encodeURIComponent(agentId)}/tools`, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` }
+  })
+}
+
+export async function bindAgentKnowledgeBases(token, agentId, kbIds) {
+  return apiRequest(`/api/agents/${encodeURIComponent(agentId)}/knowledge-bases`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify({ knowledge_base_ids: kbIds })
+  })
+}
+
+export async function listAgentKnowledgeBases(token, agentId) {
+  return apiRequest(`/api/agents/${encodeURIComponent(agentId)}/knowledge-bases`, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${token}` }
+  })
+}
