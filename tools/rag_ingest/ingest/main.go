@@ -2,84 +2,100 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
 	"gotaskai/internal/config"
+	"gotaskai/internal/pkg/llm"
+	"gotaskai/internal/pkg/ragstore"
 
-	"github.com/tmc/langchaingo/embeddings"
-	"github.com/tmc/langchaingo/llms/ollama"
 	"github.com/tmc/langchaingo/schema"
 	"github.com/tmc/langchaingo/textsplitter"
-	"github.com/tmc/langchaingo/vectorstores/redisvector"
 )
 
 func main() {
+	rebuild := flag.Bool("rebuild", false, "删除已有 Collection 后重建（切换 embedding 模型后建议开启）")
+	flag.Parse()
+
 	// 1. 初始化配置
 	config.InitConfig("config/config.yaml")
 	ctx := context.Background()
 
-	// 2. 初始化 Ollama 模型客户端 (用于生成 Embedding 向量)
-	llm, err := ollama.New(
-		ollama.WithServerURL("http://localhost:11434"),
-		ollama.WithModel("bge-m3"),
-	)
-	if err != nil {
-		log.Fatalf("初始化 Ollama 失败: %v", err)
-	}
-	embedder, err := embeddings.NewEmbedder(llm)
+	// 2. 初始化阿里百炼 DashScope 向量化器（Qwen3-Embedding）
+	embedder, err := llm.NewEmbedder()
 	if err != nil {
 		log.Fatalf("初始化 Embedder 失败: %v", err)
 	}
 
-	// 3. 读取原始文件
-	content, err := os.ReadFile("data/pangu_knowledge.md")
+	mc := config.AppConfig.Milvus
+	storeCfg := ragstore.Config{
+		Address:        fmt.Sprintf("%s:%d", mc.Host, mc.Port),
+		CollectionName: mc.CollectionName,
+		Dim:            mc.Dim,
+		Embedder:       embedder,
+	}
+
+	if *rebuild {
+		tmp, err := ragstore.New(ctx, storeCfg)
+		if err != nil {
+			log.Fatalf("初始化 Milvus 连接失败: %v", err)
+		}
+		if err := tmp.DropCollection(ctx); err != nil {
+			log.Fatalf("删除旧 Collection 失败: %v", err)
+		}
+		_ = tmp.Close()
+		fmt.Println("已删除旧 Collection，开始全量重建...")
+	}
+
+	store, err := ragstore.New(ctx, storeCfg)
 	if err != nil {
-		log.Fatalf("读取文件失败: %v", err)
+		log.Fatalf("初始化 Milvus 向量库失败: %v", err)
+	}
+	defer store.Close()
+
+	// 3. 收集待入库文件：默认 data 目录下所有 .md，也可用参数逐个指定
+	files := flag.Args()
+	if len(files) == 0 {
+		matches, _ := filepath.Glob(filepath.Join(config.ResolveProjectPath("data"), "*.md"))
+		files = matches
+	}
+	if len(files) == 0 {
+		log.Fatal("未找到任何可入库的 .md 文档")
 	}
 
-	// 把原始文本包装成 LangChain 标准的 Document 结构
-	doc := schema.Document{
-		PageContent: string(content),
-		Metadata: map[string]any{
-			"source": "pangu_knowledge.md",
-		},
-	}
-
-	// 4. 智能分块
 	splitter := textsplitter.NewRecursiveCharacter()
 	splitter.ChunkSize = 500
 	splitter.ChunkOverlap = 50
 
-	chunks, err := textsplitter.SplitDocuments(splitter, []schema.Document{doc})
-	if err != nil {
-		log.Fatalf("文档切分失败: %v", err)
+	for _, f := range files {
+		content, err := os.ReadFile(f)
+		if err != nil {
+			log.Printf("读取文件失败 %s: %v", f, err)
+			continue
+		}
+		doc := schema.Document{
+			PageContent: string(content),
+			Metadata: map[string]any{
+				"source": filepath.Base(f),
+				"kb_id":  "default",
+				"doc_id": filepath.Base(f),
+			},
+		}
+		chunks, err := textsplitter.SplitDocuments(splitter, []schema.Document{doc})
+		if err != nil {
+			log.Printf("文档切分失败 %s: %v", f, err)
+			continue
+		}
+		fmt.Printf("正在向量化并入库 %s（%d 个 Chunk）...\n", filepath.Base(f), len(chunks))
+		n, err := store.AddDocuments(ctx, chunks)
+		if err != nil {
+			log.Printf("入库失败 %s: %v", f, err)
+			continue
+		}
+		fmt.Printf("✅ %s 入库成功，共 %d 个 Chunk\n", filepath.Base(f), n)
 	}
-	fmt.Printf("智能切分完成，共 %d 个 Chunk\n", len(chunks))
-
-	// 5. 初始化 Redis 向量存储连接
-	redisURL := config.AppConfig.Redis.VectorStoreURL()
-	if redisURL == "" {
-		log.Fatalf("RedisVector 需要配置 redis.addr 直连地址")
-	}
-
-	store, err := redisvector.New(
-		ctx,
-		redisvector.WithConnectionURL(redisURL),
-		redisvector.WithIndexName("idx:pangu_v2", true),
-		redisvector.WithEmbedder(embedder),
-	)
-	if err != nil {
-		log.Fatalf("初始化 Redis 向量库失败: %v", err)
-	}
-
-	// 6. 一键向量化并入库
-	fmt.Println("正在向量化并入库，请稍候...")
-	_, err = store.AddDocuments(ctx, chunks)
-	if err != nil {
-		log.Fatalf("入库失败: %v", err)
-	}
-
-	fmt.Println("🎉 知识库录入成功（使用 LangChainGo）！")
+	fmt.Println("🎉 全部知识库重建完成！")
 }
