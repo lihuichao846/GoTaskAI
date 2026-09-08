@@ -51,19 +51,24 @@ func (h *Handler) BatchSubmitTasks(c *gin.Context) {
 			taskReq.Type = model.TypeCustom
 		}
 
+		conversationID := resolveConversationID(h.manager, userID, taskReq.AgentID, taskReq.SessionID)
+		ensureConversationTitle(h.manager, conversationID, taskReq.Payload)
+
 		task := &model.Task{
-			ID:           uuid.New().String(),
-			UserID:       userID,
-			SessionID:    taskReq.SessionID,
-			AgentID:      taskReq.AgentID,
-			Type:         taskReq.Type,
-			SystemPrompt: taskReq.SystemPrompt,
-			Priority:     taskReq.Priority,
-			Payload:      taskReq.Payload,
-			Status:       model.StatusPending,
-			MaxRetry:     3,
-			CreatedAt:    time.Now(),
-			UpdatedAt:    time.Now(),
+			ID:             uuid.New().String(),
+			TraceID:        uuid.New().String(),
+			UserID:         userID,
+			SessionID:      taskReq.SessionID,
+			ConversationID: conversationID,
+			AgentID:        taskReq.AgentID,
+			Type:           taskReq.Type,
+			SystemPrompt:   taskReq.SystemPrompt,
+			Priority:       taskReq.Priority,
+			Payload:        taskReq.Payload,
+			Status:         model.StatusPending,
+			MaxRetry:       3,
+			CreatedAt:      time.Now(),
+			UpdatedAt:      time.Now(),
 		}
 
 		if err := h.manager.AddTask(task); err != nil {
@@ -149,20 +154,26 @@ func (h *Handler) SubmitTask(c *gin.Context) {
 	// 从中间件上下文中提取用户 ID
 	userID := c.GetUint("userID")
 
+	// 查找或创建会话，写入 ConversationID（同时保留 SessionID 兼容旧逻辑）。
+	conversationID := resolveConversationID(h.manager, userID, req.AgentID, req.SessionID)
+	ensureConversationTitle(h.manager, conversationID, req.Payload)
+
 	// 2. 构造完整的任务实体
 	task := &model.Task{
-		ID:           uuid.New().String(), // 使用 UUID 保证任务 ID 的全局唯一性
-		UserID:       userID,              // 绑定任务与用户的关系
-		SessionID:    req.SessionID,
-		AgentID:      req.AgentID,
-		Type:         req.Type,
-		SystemPrompt: req.SystemPrompt,
-		Priority:     req.Priority, // 设置任务优先级
-		Payload:      req.Payload,
-		Status:       model.StatusPending, // 新建任务初始状态为"等待中"
-		MaxRetry:     3,                   // 默认最大允许重试 3 次
-		CreatedAt:    time.Now(),
-		UpdatedAt:    time.Now(),
+		ID:             uuid.New().String(), // 使用 UUID 保证任务 ID 的全局唯一性
+		TraceID:        uuid.New().String(), // 分布式追踪 ID，随 payload 与工具事件透传
+		UserID:         userID,              // 绑定任务与用户的关系
+		SessionID:      req.SessionID,
+		ConversationID: conversationID,
+		AgentID:        req.AgentID,
+		Type:           req.Type,
+		SystemPrompt:   req.SystemPrompt,
+		Priority:       req.Priority, // 设置任务优先级
+		Payload:        req.Payload,
+		Status:         model.StatusPending, // 新建任务初始状态为"等待中"
+		MaxRetry:       3,                   // 默认最大允许重试 3 次
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
 	}
 
 	// 3. 尝试将任务加入到队列管理器
@@ -329,17 +340,15 @@ func (h *Handler) CancelTask(c *gin.Context) {
 		return
 	}
 
-	// 只有 pending 或 processing 状态的任务才能取消
-	if task.Status != model.StatusPending && task.Status != model.StatusProcessing {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "当前状态无法取消"})
+	// 原子条件取消：仅当任务仍处于 pending/processing 时置为 cancelled，
+	// 避免与 worker 的终态回写竞争时覆盖已完成/已失败的任务（消除 TOCTOU 窗口）。
+	if !h.manager.CancelTaskIfActive(id) {
+		c.JSON(http.StatusConflict, gin.H{"error": "任务已进入终态，无法取消"})
 		return
 	}
 
-	// 多个 Worker 进程共享同一个 Redis/MySQL 状态源，直接标记为 cancelled 即可。
-	// 正在执行中的任务会在关键阶段检查取消状态，避免把最终结果回写为 completed。
-	task.Status = model.StatusCancelled
-	task.Error = "Task was cancelled by user"
-	h.manager.UpdateTask(task)
+	// 广播取消控制指令到所有 worker 进程，命中在途任务时中断其进行中的 LLM 调用。
+	h.manager.PublishTaskCancel(id)
 
 	c.JSON(http.StatusOK, gin.H{"message": "任务已标记为取消"})
 }
@@ -369,24 +378,30 @@ func (h *Handler) StreamTasks(c *gin.Context) {
 	// 允许跨域（视情况配置）
 	c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// 向管理器订阅当前用户的任务更新事件
+	// 向管理器订阅当前用户的任务更新与工具调用事件
 	ch := h.manager.Subscribe(userID)
-	// 确保连接断开时取消订阅，防止内存泄漏
 	defer h.manager.Unsubscribe(userID, ch)
+	toolCh := h.manager.SubscribeToolEvents(userID)
+	defer h.manager.UnsubscribeToolEvents(userID, toolCh)
 
-	// 监听客户端连接断开事件
-	clientGone := c.Writer.CloseNotify()
+	// 监听客户端连接断开事件。
+	// 用请求上下文取消而非已弃用的 c.Writer.CloseNotify()：后者在部分中间件包装后可能不可用，
+	// 导致客户端断开时无法感知，造成订阅/goroutine 泄漏。
+	ctx := c.Request.Context()
 
 	// 持续监听管道，有数据就推给前端
 	for {
 		select {
-		case <-clientGone:
+		case <-ctx.Done():
 			// 客户端主动断开了连接 (例如关闭了浏览器标签页)
 			return
 		case task := <-ch:
-			// 接收到状态更新，推送到前端
+			// 接收到任务状态更新，推送到前端
 			c.SSEvent("task_update", task)
-			// 必须调用 Flush，把缓冲的数据立即发出去
+			c.Writer.Flush()
+		case ev := <-toolCh:
+			// 接收到工具调用过程事件，推送到前端
+			c.SSEvent("tool_call", ev)
 			c.Writer.Flush()
 		}
 	}

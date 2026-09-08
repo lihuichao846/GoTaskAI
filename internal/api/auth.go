@@ -139,7 +139,7 @@ func (h *AuthHandler) RequestResetCode(c *gin.Context) {
 	fmt.Println("\n=======================================================")
 	fmt.Printf("[模拟短信/邮件] 账号 %s 的密码重置验证码是: %s\n", req.Username, code)
 	fmt.Println("请在 5 分钟内输入验证码完成重置。")
-	fmt.Println("=======================================================\n")
+	fmt.Println("=======================================================")
 
 	c.JSON(http.StatusOK, gin.H{"message": "验证码已发送，请检查控制台输出"})
 }

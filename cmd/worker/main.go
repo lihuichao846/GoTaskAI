@@ -2,21 +2,26 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"gotaskai/internal/config"
 	"gotaskai/internal/db"
+	"gotaskai/internal/events"
 	"gotaskai/internal/pkg/kag"
 	"gotaskai/internal/pkg/llm"
 	"gotaskai/internal/pkg/mcpclient"
 	"gotaskai/internal/queue"
 	"gotaskai/internal/worker"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strconv"
 	"sync"
 	"syscall"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const workerChildIndexEnv = "GOTASKAI_WORKER_CHILD_INDEX"
@@ -101,9 +106,24 @@ func runWorkerProcess(cfg config.Config) {
 	mysqlDB := db.InitMySQL(cfg.MySQL.DSN)
 	redisClient := db.InitRedis(cfg.Redis)
 
-	// 2. 初始化核心任务管理器 (Task Manager - 作为消费者状态更新器)
+	// 2. 初始化实时事件通道（NATS 客户端）：Worker 作为事件发布方连接到 API 内嵌的 NATS Server。
+	var eventBus *events.EventBus
+	if cfg.EventBus.Enabled && cfg.EventBus.URL != "" {
+		bus, err := events.New(cfg.EventBus.URL)
+		if err != nil {
+			slog.Warn("Failed to connect to event bus (NATS), real-time events disabled", "error", err)
+		} else {
+			eventBus = bus
+			defer eventBus.Close()
+			slog.Info("Connected to event bus (NATS)", "url", cfg.EventBus.URL)
+		}
+	} else {
+		slog.Warn("Event bus (NATS) disabled, cross-process real-time events will not be delivered")
+	}
+
+	// 3. 初始化核心任务管理器 (Task Manager - 作为消费者状态更新器)
 	redisOpt := db.NewAsynqRedisConnOpt(cfg.Redis)
-	manager := queue.NewTaskManager(mysqlDB, redisClient, redisOpt)
+	manager := queue.NewTaskManager(mysqlDB, redisClient, redisOpt, eventBus)
 	defer manager.Close()
 
 	// 初始化 Neo4j 客户端及 KAG 管理器 (用于 Worker 图谱检索)
@@ -131,6 +151,9 @@ func runWorkerProcess(cfg config.Config) {
 	pool.Start()
 	slog.Info("Worker pool started", "child_index", childIndex, "workers", cfg.Queue.Workers)
 
+	// 启动 Prometheus /metrics 端点（子进程用独立端口，避免多子进程冲突）。
+	startMetricsServer(cfg, childIndex)
+
 	// 4. 优雅退出处理：监听系统级退出信号
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -140,4 +163,22 @@ func runWorkerProcess(cfg config.Config) {
 
 	pool.Stop() // 停止消费队列任务，等待当前任务完成
 	slog.Info("Worker child exiting", "child_index", childIndex)
+}
+
+// startMetricsServer 启动 Prometheus /metrics HTTP 端点。
+// Worker 子进程使用独立端口（base + childIndex + 1），避免 supervisor 多子进程端口冲突。
+func startMetricsServer(cfg config.Config, childIndex int) {
+	if cfg.Metrics.Port <= 0 {
+		return
+	}
+	port := cfg.Metrics.Port + childIndex + 1
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	srv := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: mux}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("metrics server failed", "port", port, "error", err)
+		}
+	}()
+	slog.Info("metrics server started", "port", port)
 }

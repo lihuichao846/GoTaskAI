@@ -17,15 +17,34 @@ type Wrapper struct {
 
 // NewWrapper 启动一个 MCP Server 子进程，并通过 Stdio 与之建立连接
 func NewWrapper(ctx context.Context, command string, args ...string) (*Wrapper, error) {
-	// 使用系统环境变量
+	return NewWrapperWithEnv(ctx, command, nil, args...)
+}
+
+// NewWrapperWithEnv 启动一个 Stdio MCP Server，可额外注入指定的环境变量。
+func NewWrapperWithEnv(ctx context.Context, command string, extraEnv map[string]string, args ...string) (*Wrapper, error) {
 	env := os.Environ()
+	for k, v := range extraEnv {
+		env = append(env, k+"="+v)
+	}
 
 	c, err := client.NewStdioMCPClient(command, env, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create stdio mcp client: %w", err)
 	}
+	return initWrapper(ctx, c)
+}
 
-	// 初始化连接
+// NewHTTPWrapper 通过远程 URL（SSE/HTTP）连接 MCP Server。
+func NewHTTPWrapper(ctx context.Context, url string) (*Wrapper, error) {
+	c, err := client.NewSSEMCPClient(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create sse mcp client: %w", err)
+	}
+	return initWrapper(ctx, c)
+}
+
+// initWrapper 对已创建的 MCP Client 执行握手初始化。
+func initWrapper(ctx context.Context, c *client.Client) (*Wrapper, error) {
 	initRequest := mcp.InitializeRequest{}
 	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initRequest.Params.ClientInfo = mcp.Implementation{

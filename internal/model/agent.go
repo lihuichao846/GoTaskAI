@@ -10,6 +10,8 @@ type Agent struct {
 	Name         string    `json:"name" gorm:"type:varchar(100)"`              // Agent 名称
 	SystemPrompt string    `json:"system_prompt" gorm:"type:text"`             // 系统角色设定
 	Model        string    `json:"model" gorm:"type:varchar(100)"`             // 覆盖平台默认模型，为空则用默认
+	APIKey       string    `json:"api_key" gorm:"type:varchar(255)"`           // 覆盖平台默认 API Key，为空则用默认
+	BaseURL      string    `json:"base_url" gorm:"type:varchar(255)"`          // 覆盖平台默认接口地址，为空则用默认
 	Status       string    `json:"status" gorm:"type:varchar(20);index"`       // active/archived
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
