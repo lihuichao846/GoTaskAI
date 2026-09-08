@@ -3,42 +3,56 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"gotaskai/internal/config"
+	"gotaskai/internal/metrics"
 	"gotaskai/internal/model"
 	"gotaskai/internal/pkg/kag"
 	"gotaskai/internal/pkg/llm"
 	"gotaskai/internal/pkg/mcpclient"
+	"gotaskai/internal/pkg/ragstore"
+	"gotaskai/internal/pkg/rerank"
+	"gotaskai/internal/pkg/toolregistry"
 	"gotaskai/internal/queue"
 	"log"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	"github.com/sashabaranov/go-openai"
 	"github.com/tmc/langchaingo/embeddings"
-	"github.com/tmc/langchaingo/llms/ollama"
-	"github.com/tmc/langchaingo/vectorstores/redisvector"
+	"github.com/tmc/langchaingo/schema"
+	"github.com/tmc/langchaingo/textsplitter"
 )
 
-// Pool 维护一个基于 Asynq 的 Worker 池
+// Pool 维护一个基于 Asynq 的 Worker 池。
 type Pool struct {
-	server     *asynq.Server
-	mux        *asynq.ServeMux
-	manager    *queue.TaskManager
-	llmClient  *llm.Client
-	mcpClient  *mcpclient.Wrapper
-	ragStore   *redisvector.Store // 增加 RAG 向量存储客户端
-	kagManager *kag.KAGManager    // 增加 KAG 图谱管理器
+	server       *asynq.Server
+	mux          *asynq.ServeMux
+	manager      *queue.TaskManager
+	llmClient    *llm.Client
+	mcpClient    *mcpclient.Wrapper
+	ragStore     *ragstore.Store
+	reranker     rerank.Reranker
+	kagManager   *kag.KAGManager
+	toolRegistry *toolregistry.Registry
+	mcpPool      *mcpclient.Pool
+	embedder     embeddings.Embedder
+
+	// inFlight 维护本进程正在处理的任务的取消函数，供取消控制指令中断进行中的 LLM 调用。
+	inFlightMu sync.Mutex
+	inFlight   map[string]context.CancelFunc
 }
 
-// NewPool 创建一个 Asynq Worker 服务器
+// NewPool 创建一个 Asynq Worker 服务器。
 func NewPool(workers int, manager *queue.TaskManager, redisOpt asynq.RedisConnOpt, mcpClient *mcpclient.Wrapper, kagManager *kag.KAGManager) *Pool {
 	srv := asynq.NewServer(
 		redisOpt,
 		asynq.Config{
-			// 并发数
 			Concurrency: workers,
-			// 指定不同队列的优先级 (数字越大，优先级越高)
 			Queues: map[string]int{
 				"high":    6,
 				"default": 3,
@@ -49,54 +63,73 @@ func NewPool(workers int, manager *queue.TaskManager, redisOpt asynq.RedisConnOp
 
 	mux := asynq.NewServeMux()
 
-	// 初始化 RAG Vector Store
-	var ragStore *redisvector.Store
-	ollamaClient, err := ollama.New(
-		ollama.WithServerURL("http://localhost:11434"),
-		ollama.WithModel("bge-m3"),
-	)
-	if err == nil {
-		embedder, err := embeddings.NewEmbedder(ollamaClient)
-		if err == nil {
-			redisURL := config.AppConfig.Redis.VectorStoreURL()
-			if redisURL == "" {
-				log.Printf("RedisVector disabled: redis.addr is required when Redis Sentinel mode is enabled")
-			} else {
-				store, err := redisvector.New(
-					context.Background(),
-					redisvector.WithConnectionURL(redisURL),
-					redisvector.WithIndexName("idx:pangu_v2", false), // false 表示不主动创建
-					redisvector.WithEmbedder(embedder),
-				)
-				if err == nil {
-					ragStore = store
-					log.Println("RAG Vector Store initialized in Worker Pool")
-				} else {
-					log.Printf("Failed to init redisvector: %v", err)
-				}
-			}
+	var embedder embeddings.Embedder
+	var ragStore *ragstore.Store
+
+	emb, merr := llm.NewEmbedder()
+	if merr == nil {
+		embedder = emb
+		mc := config.AppConfig.Milvus
+		store, serr := ragstore.New(context.Background(), ragstore.Config{
+			Address:        fmt.Sprintf("%s:%d", mc.Host, mc.Port),
+			CollectionName: mc.CollectionName,
+			Dim:            mc.Dim,
+			Embedder:       embedder,
+		})
+		if serr == nil {
+			ragStore = store
+			log.Println("RAG Vector Store (Milvus) initialized in Worker Pool")
+		} else {
+			log.Printf("Failed to init Milvus ragstore: %v", serr)
 		}
 	} else {
-		log.Printf("Failed to init ollama embedder for RAG: %v", err)
+		log.Printf("Failed to init embedding for RAG: %v", merr)
+	}
+
+	// 初始化召回重排器（可选）：阿里云百炼 DashScope 的 qwen3-rerank 云端重排模型。
+	var reranker rerank.Reranker
+	if rc := config.AppConfig.Rerank; rc.Enabled && rc.BaseURL != "" && rc.APIKey != "" && rc.Model != "" {
+		reranker = rerank.NewDashScope(rc.BaseURL, rc.APIKey, rc.Model)
+		log.Printf("Reranker (DashScope) initialized with model %s", rc.Model)
+	}
+
+	// 初始化 Tool Registry：内置工具 + 已连接的 MCP 工具。
+	toolRegistry := toolregistry.NewRegistry()
+	toolregistry.RegisterBuiltins(toolRegistry)
+	if mcpClient != nil {
+		if mcpTools, terr := mcpClient.GetTools(context.Background()); terr == nil {
+			for _, t := range mcpTools {
+				toolRegistry.Register(toolregistry.NewMCPServerTool(mcpClient, t))
+			}
+			log.Printf("Registered %d MCP tools from search_mcp", len(mcpTools))
+		}
 	}
 
 	pool := &Pool{
-		server:     srv,
-		mux:        mux,
-		manager:    manager,
-		llmClient:  llm.NewClient(),
-		mcpClient:  mcpClient,
-		ragStore:   ragStore,
-		kagManager: kagManager,
+		server:       srv,
+		mux:          mux,
+		manager:      manager,
+		llmClient:    llm.NewClient(),
+		mcpClient:    mcpClient,
+		ragStore:     ragStore,
+		reranker:     reranker,
+		kagManager:   kagManager,
+		toolRegistry: toolRegistry,
+		mcpPool:      mcpclient.NewPool(),
+		embedder:     embedder,
+		inFlight:     make(map[string]context.CancelFunc),
 	}
 
-	// 注册处理函数
 	mux.HandleFunc("task:process", pool.handleTaskProcess)
+	mux.HandleFunc("kb:build", pool.handleKBBuild)
+
+	// 订阅任务取消控制指令（NATS 广播）：命中本进程在途任务时中断其进行中的 LLM 调用。
+	manager.SubscribeTaskCancel(pool.cancelTask)
 
 	return pool
 }
 
-// Start 启动 Asynq Server 开始消费任务
+// Start 启动 Asynq Server 开始消费任务。
 func (p *Pool) Start() {
 	go func() {
 		if err := p.server.Run(p.mux); err != nil {
@@ -106,56 +139,565 @@ func (p *Pool) Start() {
 	log.Println("Asynq Worker pool started")
 }
 
-// Stop 优雅地停止工作池
+// Stop 优雅地停止工作池。
 func (p *Pool) Stop() {
 	p.server.Stop()
+	p.mcpPool.Close()
 	log.Println("Asynq Worker pool stopped")
 }
 
-// handleTaskProcess 是 Asynq 路由的处理函数，负责处理实际的 AI 任务
+// registerInFlight 登记任务的可取消上下文，供取消控制指令命中。
+func (p *Pool) registerInFlight(taskID string, cancel context.CancelFunc) {
+	p.inFlightMu.Lock()
+	p.inFlight[taskID] = cancel
+	p.inFlightMu.Unlock()
+}
+
+// unregisterInFlight 移除任务的可取消上下文。
+func (p *Pool) unregisterInFlight(taskID string) {
+	p.inFlightMu.Lock()
+	delete(p.inFlight, taskID)
+	p.inFlightMu.Unlock()
+}
+
+// cancelTask 中断指定任务的进行中 LLM 调用（若有）。
+func (p *Pool) cancelTask(taskID string) {
+	p.inFlightMu.Lock()
+	cancel, ok := p.inFlight[taskID]
+	p.inFlightMu.Unlock()
+	if ok {
+		log.Printf("[Worker] cancelling in-flight task %s", taskID)
+		cancel()
+	}
+}
+
+// resolveTools 根据任务绑定的 Agent 返回可用的工具白名单，并动态加载私有 MCP 工具。
+func (p *Pool) resolveTools(ctx context.Context, t model.Task) []toolregistry.Tool {
+	if t.AgentID == "" {
+		return p.toolRegistry.List()
+	}
+
+	bound := p.manager.ListAgentTools(t.AgentID)
+	if len(bound) == 0 {
+		return nil
+	}
+
+	out := make([]toolregistry.Tool, 0, len(bound))
+	for _, bt := range bound {
+		// 工具被停用（disabled）时，即使绑定到 Agent 也不加载，确保运行时彻底不可用。
+		if bt.Status == "disabled" {
+			continue
+		}
+
+		// 优先匹配静态注册的工具（内置 + search_mcp）。
+		if static, ok := p.toolRegistry.Get(bt.Name); ok {
+			out = append(out, static)
+			continue
+		}
+
+		// 用户私有 MCP 工具：按 config 动态拉起连接（支持 stdio 子进程或远程 URL）。
+		if bt.Type == "mcp" && bt.Config != "" {
+			var cfg model.ToolConfig
+			if err := json.Unmarshal([]byte(bt.Config), &cfg); err == nil && cfg.Valid() {
+				wrapper, err := p.mcpPool.Get(ctx, bt.ID, cfg.Command, cfg.URL, cfg.Args, cfg.Env)
+				if err != nil {
+					log.Printf("[Worker] Failed to connect MCP tool %s: %v", bt.Name, err)
+					continue
+				}
+				mcpTools, err := wrapper.GetTools(ctx)
+				if err != nil {
+					log.Printf("[Worker] Failed to list tools from %s: %v", bt.Name, err)
+					continue
+				}
+				for _, mt := range mcpTools {
+					out = append(out, toolregistry.NewMCPServerTool(wrapper, mt))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// hasToolName 判断工具列表中是否包含指定名称的工具。
+func hasToolName(tools []toolregistry.Tool, name string) bool {
+	for _, t := range tools {
+		if t.Name() == name {
+			return true
+		}
+	}
+	return false
+}
+
+// retrieveKnowledge 返回注入 system_prompt 的知识库检索上下文。
+// 采用渐进式披露：先注入命中文档的摘要层，再按 Score 分层注入截断后的命中片段，并受总量上限约束。
+func (p *Pool) retrieveKnowledge(ctx context.Context, t model.Task) string {
+	if p.ragStore == nil {
+		return ""
+	}
+
+	cc := config.AppConfig.Context
+	topK := 3
+	if rc := config.AppConfig.Rerank; rc.TopN > 0 {
+		topK = rc.TopN
+	}
+
+	var sb strings.Builder
+	// write 在达到上下文总量上限时停止追加，返回是否继续。
+	write := func(s string) bool {
+		if cc.MaxContextChars > 0 && sb.Len()+len(s) > cc.MaxContextChars {
+			return false
+		}
+		sb.WriteString(s)
+		return true
+	}
+
+	// appendKBDocs 注入单个知识库的摘要层与命中层（按 Score 分层），返回是否继续追加。
+	appendKBDocs := func(kbName string, docs []schema.Document) bool {
+		normalizeScores(docs)
+
+		if summaries := p.collectDocSummaries(docs); len(summaries) > 0 {
+			if !write(fmt.Sprintf("【%s · 文档摘要】\n", kbName)) {
+				return false
+			}
+			for _, summary := range summaries {
+				if !write(fmt.Sprintf("- %s\n", truncateChunk(summary, cc.MaxChunkChars))) {
+					return false
+				}
+			}
+		}
+
+		if !write(fmt.Sprintf("【%s · 片段】\n", kbName)) {
+			return false
+		}
+		// 上下文感知分块（B1）：以命中块为中心做块级窗口扩展，补回原文档相邻上下文。
+		expanded, err := p.expandChunks(ctx, docs, cc)
+		if err != nil {
+			// 扩窗失败不阻断注入，退回原始命中块（等价改造前行为）。
+			expanded = docs
+		}
+		for i, doc := range expanded {
+			if !write(fmt.Sprintf("片段 %d:\n%s\n\n", i+1, chunkByScore(doc, cc))) {
+				return false
+			}
+		}
+		return true
+	}
+
+	if t.AgentID != "" {
+		kbs := p.manager.ListAgentKnowledgeBases(t.AgentID)
+		if len(kbs) > 0 {
+			for _, kb := range kbs {
+				docs, err := p.retrieveTopDocs(ctx, t.Payload, kb.ID, topK)
+				if err != nil {
+					log.Printf("[Worker] KB %s retrieval failed: %v", kb.ID, err)
+					continue
+				}
+				if len(docs) == 0 {
+					continue
+				}
+				if !appendKBDocs(kb.Name, docs) {
+					return sb.String()
+				}
+			}
+			if sb.Len() > 0 {
+				return sb.String()
+			}
+		}
+	}
+
+	// 未绑定知识库时回退公共/默认知识检索（同样注入摘要层 + 命中层）。
+	docs, err := p.retrieveTopDocs(ctx, t.Payload, "", topK)
+	if err == nil && len(docs) > 0 {
+		appendKBDocs("公共知识", docs)
+	}
+	return sb.String()
+}
+
+// collectDocSummaries 按命中文档顺序返回其构建期摘要（去重、有序）。
+func (p *Pool) collectDocSummaries(docs []schema.Document) []string {
+	seen := make(map[string]bool)
+	var docIDs []string
+	for _, d := range docs {
+		if id, ok := d.Metadata["doc_id"].(string); ok && id != "" && !seen[id] {
+			seen[id] = true
+			docIDs = append(docIDs, id)
+		}
+	}
+	if len(docIDs) == 0 {
+		return nil
+	}
+	summaries := p.manager.GetDocumentSummaries(docIDs)
+	out := make([]string, 0, len(docIDs))
+	for _, id := range docIDs {
+		if s, ok := summaries[id]; ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// expandChunks 对命中块做上下文感知窗口扩展（B1 主路径）。
+// 以命中块 chunk_index 为中心，从 Milvus 按 doc_id 取回该文档有序 chunk 序列，
+// 取前后 ±ChunkContextWindow 个相邻块，汇总为局部连续上下文并按「doc_id:chunk_index」去重。
+// 扩展邻居块沿用命中块的归一化 Score（保持同一分层截断口径）。
+// 若当前 Collection 无 chunk_index（存量，B2）则回退 Document.Content 全文兜底（受 EnableParentContext 控制）；
+// 会话阈值或未启用窗口时直接返回原始命中块（等价改造前行为）。
+func (p *Pool) expandChunks(ctx context.Context, docs []schema.Document, cc config.ContextConfig) ([]schema.Document, error) {
+	if cc.ChunkContextWindow <= 0 || p.ragStore == nil {
+		return docs, nil
+	}
+
+	seen := make(map[string]bool, len(docs)*3)
+	expanded := make([]schema.Document, 0, len(docs)*3)
+
+	for _, d := range docs {
+		docID, _ := d.Metadata["doc_id"].(string)
+		if docID == "" {
+			// 无文档归属的命中块（如默认公共块）无法扩窗，按原始方式注入。
+			expanded = append(expanded, d)
+			continue
+		}
+		hitIdx, _ := d.Metadata["chunk_index"].(int64)
+
+		chunks, err := p.ragStore.GetChunksByDocID(ctx, docID)
+		if err != nil {
+			log.Printf("[Worker] expand window for doc %s failed: %v", docID, err)
+			chunks = nil
+		}
+
+		if len(chunks) == 0 {
+			// B2 降级：存量无 chunk_index 或取块失败。若启用父上下文兜底，注入全文。
+			if cc.EnableParentContext {
+				key := "doc-full:" + docID
+				if !seen[key] {
+					if d2, ok := p.manager.GetDocument(docID); ok && d2.Content != "" {
+						seen[key] = true
+						expanded = append(expanded, schema.Document{
+							PageContent: d2.Content,
+							Score:       d.Score,
+							Metadata: map[string]any{
+								"doc_id": docID,
+							},
+						})
+					}
+				}
+				continue
+			}
+			key := fmt.Sprintf("doc:%s:%d", docID, hitIdx)
+			if !seen[key] {
+				seen[key] = true
+				expanded = append(expanded, d)
+			}
+			continue
+		}
+
+		// 在有序块序列中定位命中块，取窗口并去重追加。
+		expanded = addWindowChunks(chunks, docID, hitIdx, d.Score, cc.ChunkContextWindow, seen, expanded)
+	}
+	return expanded, nil
+}
+
+// addWindowChunks 在已知某文档的有序块序列 ordered 中，以命中块 hitIdx 为中心取前后 ±window 个相邻块，
+// 通过 seen（key = "doc_id:chunk_index"）去重后追加到 expanded；邻居块 Score 统一置为命中块 hitScore，
+// 以保持与命中块相同的分层截断口径。若在 ordered 中未定位到命中块，则原样返回 expanded（不追加）。
+func addWindowChunks(ordered []schema.Document, docID string, hitIdx int64, hitScore float32, window int, seen map[string]bool, expanded []schema.Document) []schema.Document {
+	center := -1
+	for ci, c := range ordered {
+		if ciIdx, _ := c.Metadata["chunk_index"].(int64); ciIdx == hitIdx {
+			center = ci
+			break
+		}
+	}
+	if center < 0 {
+		return expanded
+	}
+
+	lo, hi := windowRange(center, window, len(ordered))
+	for ci := lo; ci <= hi; ci++ {
+		c := ordered[ci]
+		ciIdx, _ := c.Metadata["chunk_index"].(int64)
+		key := fmt.Sprintf("doc:%s:%d", docID, ciIdx)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		// 邻居块与命中块统一沿用命中块 Score，保持同一分层截断口径。
+		c.Score = hitScore
+		expanded = append(expanded, c)
+	}
+	return expanded
+}
+
+// windowRange 返回以 center 为中心、前后各 window 个相邻块的下标范围 [lo, hi]，
+// 并将边界裁剪到合法区间 [0, total-1]（total<=0 时返回 [0, -1] 表示空窗口）。
+func windowRange(center, window, total int) (lo, hi int) {
+	lo = center - window
+	if lo < 0 {
+		lo = 0
+	}
+	hi = center + window
+	if hi >= total {
+		hi = total - 1
+	}
+	return lo, hi
+}
+
+// normalizeScores 将文档分数 min-max 归一化到 [0,1]（最低分=0、最高分=1），使 RRF 与 reranker 分数可统一比较。
+func normalizeScores(docs []schema.Document) {
+	if len(docs) <= 1 {
+		return
+	}
+	min, max := docs[0].Score, docs[0].Score
+	for _, d := range docs {
+		if d.Score < min {
+			min = d.Score
+		}
+		if d.Score > max {
+			max = d.Score
+		}
+	}
+	if max <= min {
+		return
+	}
+	for i := range docs {
+		docs[i].Score = (docs[i].Score - min) / (max - min)
+	}
+}
+
+// chunkByScore 按归一化分数分层：高分注入全文截断，低分降级为更短截断。
+func chunkByScore(doc schema.Document, cc config.ContextConfig) string {
+	if cc.MaxChunkChars <= 0 {
+		return doc.PageContent // 未启用截断
+	}
+	full := truncateChunk(doc.PageContent, cc.MaxChunkChars)
+	if cc.RagScoreThreshold <= 0 {
+		return full // 未启用分层
+	}
+	if doc.Score >= cc.RagScoreThreshold {
+		return full
+	}
+	shortMax := cc.MaxChunkChars / 2
+	if shortMax <= 0 {
+		shortMax = 1
+	}
+	return truncateChunk(doc.PageContent, shortMax)
+}
+
+// truncateChunk 按字符（rune）截断超长片段，避免破坏多字节字符。
+func truncateChunk(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "..."
+}
+
+// retrieveTopDocs 先做 Milvus 双路召回，再调用 reranker 重排取前 topK。
+// 未启用 reranker 时退化为直接召回 topK。
+func (p *Pool) retrieveTopDocs(ctx context.Context, query, kbID string, topK int) ([]schema.Document, error) {
+	if p.reranker == nil {
+		return p.ragStore.SimilaritySearch(ctx, query, kbID, topK)
+	}
+
+	// 重排需要更宽的候选集，召回 3 倍候选再由 reranker 收敛到 topK。
+	retrieveK := topK * 3
+	if retrieveK < 5 {
+		retrieveK = 5
+	}
+	candidates, err := p.ragStore.SimilaritySearch(ctx, query, kbID, retrieveK)
+	if err != nil {
+		return nil, err
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	docs, err := p.reranker.Rerank(ctx, query, candidates, topK)
+	if err != nil {
+		log.Printf("[Worker] rerank failed, fallback to recall order: %v", err)
+		if len(candidates) > topK {
+			return candidates[:topK], nil
+		}
+		return candidates, nil
+	}
+	return docs, nil
+}
+
+// loadConversationHistory 按 token 预算加载会话历史，并在上下文达到阈值时自动压缩较早轮次为摘要。
+// 返回给 LLM 的消息切片：最前是一条「此前对话摘要」system 消息（若已存在摘要），其后为最近保留的原始轮次。
+func (p *Pool) loadConversationHistory(ctx context.Context, conversationID string, systemPrompt string, userPrompt string) []openai.ChatCompletionMessage {
+	cc := config.AppConfig.Compress
+	lc := config.AppConfig.LLM
+
+	// 触发压缩的 token 阈值 = 上下文窗口 × 压缩比例。
+	threshold := int(float64(lc.ContextWindow) * lc.CompressThreshold)
+	if lc.ContextWindow <= 0 || lc.CompressThreshold <= 0 {
+		threshold = 0 // 未配置阈值时不压缩
+	}
+
+	// 配置缺省值兜底。
+	maxHistory := cc.MaxHistory
+	if maxHistory <= 0 {
+		maxHistory = 20
+	}
+	keepRecent := cc.KeepRecent
+	if keepRecent <= 0 {
+		keepRecent = 6
+	}
+	minTurns := cc.MinTurns
+	if minTurns <= 0 {
+		minTurns = keepRecent + 2
+	}
+
+	// 已压缩到哪条任务：避免重复取到已被记忆进摘要的旧轮次。
+	summary, cutoff := p.manager.GetConversationCompressState(conversationID)
+
+	var turns []*model.Task
+	if cc.Enabled {
+		turns = p.manager.GetConversationHistorySince(conversationID, cutoff, maxHistory)
+	} else {
+		turns = p.manager.GetConversationHistory(conversationID, maxHistory)
+	}
+
+	// taskToMessages 把一条任务换算为 user/assistant 两个消息。
+	taskToMessages := func(ht *model.Task) []openai.ChatCompletionMessage {
+		msgs := []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleUser, Content: ht.Payload},
+		}
+		if ht.Result != "" {
+			msgs = append(msgs, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleAssistant,
+				Content: ht.Result,
+			})
+		}
+		return msgs
+	}
+
+	// buildHistory 组装「摘要 system 消息 + 最近原始轮次」。
+	buildHistory := func(summaryText string, recent []*model.Task) []openai.ChatCompletionMessage {
+		var hist []openai.ChatCompletionMessage
+		if strings.TrimSpace(summaryText) != "" {
+			hist = append(hist, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: "以下是此前对话的压缩摘要，请结合它理解上下文，避免与用户重复确认过去已确定的内容：\n" + strings.TrimSpace(summaryText),
+			})
+		}
+		for _, t := range recent {
+			hist = append(hist, taskToMessages(t)...)
+		}
+		return hist
+	}
+
+	hist := buildHistory(summary, turns)
+
+	// 未启用压缩、或阈值未配置：直接返回原始历史。
+	if !cc.Enabled || threshold <= 0 {
+		return hist
+	}
+
+	used := llm.EstimateMessagesTokens(systemPrompt, hist, userPrompt)
+	if used <= threshold {
+		return hist
+	}
+
+	// 全部轮次都在保留窗口内（无需/无法压缩），保持原样。
+	if len(turns) <= keepRecent || len(turns) < minTurns {
+		return hist
+	}
+
+	// 需要压缩：把最早的 (len(turns)-keepRecent) 轮压缩为摘要，仅保留最近 keepRecent 轮原始消息。
+	split := len(turns) - keepRecent
+	toCompress := turns[:split]
+	recent := turns[split:]
+
+	var toCompressMsgs []openai.ChatCompletionMessage
+	for _, t := range toCompress {
+		toCompressMsgs = append(toCompressMsgs, taskToMessages(t)...)
+	}
+
+	metrics.CompressTotal.Inc()
+	newSummary, err := p.llmClient.CompressHistory(ctx, "", summary, toCompressMsgs)
+	if err != nil {
+		// 压缩失败属可告警信号：静默回退全量历史会放大后续 token 成本，需能被观测/告警。
+		metrics.CompressFailed.Inc()
+		log.Printf("[Worker][ALERT] conversation compress failed, keeping full history: %v", err)
+		return hist
+	}
+
+	// 持久化摘要与 cutoff（cutoff 指向被压缩的最后一轮的创建时间）。
+	cutoffTime := toCompress[len(toCompress)-1].CreatedAt
+	if err := p.manager.SaveConversationSummary(conversationID, newSummary, &cutoffTime); err != nil {
+		log.Printf("[Worker] failed to persist conversation summary: %v", err)
+	}
+
+	log.Printf("[Worker] conversation %s compressed %d historic turns into summary", conversationID, len(toCompress))
+	return buildHistory(newSummary, recent)
+}
+
+// handleTaskProcess 是 Asynq 路由的处理函数，负责处理实际的 AI 任务。
 func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) error {
 	var t model.Task
 	if err := json.Unmarshal(asynqTask.Payload(), &t); err != nil {
 		return fmt.Errorf("json.Unmarshal failed: %v", err)
 	}
 
-	// 在真正开始处理前，检查任务是否被取消
 	latestTask, ok := p.manager.GetTask(t.ID)
-	if ok && latestTask.Status == model.StatusCancelled {
+	if ok {
+		if latestTask.Status == model.StatusCancelled {
+			log.Printf("[Worker] Task %s was cancelled before processing, skipping", t.ID)
+			return nil
+		}
+		// 以 DB 最新状态为准覆盖 payload 旧值：asynq 重试时复用原始 payload，
+		// 其中的 Retries 不会随每次重试递增，若不覆盖，业务级 MaxRetry 将失效。
+		t.Retries = latestTask.Retries
+		if latestTask.MaxRetry > 0 {
+			t.MaxRetry = latestTask.MaxRetry
+		}
+	}
+
+	t.Status = model.StatusProcessing
+	if !p.manager.UpdateTaskIfActive(&t) {
 		log.Printf("[Worker] Task %s was cancelled before processing, skipping", t.ID)
 		return nil
 	}
 
-	// 更新内存和数据库状态为"处理中"
-	t.Status = model.StatusProcessing
-	p.manager.UpdateTask(&t)
-
 	log.Printf("[Worker] Processing task %s (%s)", t.ID, t.Type)
 
-	systemPrompt := t.SystemPrompt
-	var modelName string
+	// 提前解析本次任务可用的工具，用于决定是否注入「强制联网搜索」指令。
+	tools := p.resolveTools(ctx, t)
 
-	// 若任务关联了 Agent，则用 Agent 的持久化配置覆盖临时配置
-	if t.AgentID != "" {
-		if agent, ok := p.manager.GetAgent(t.AgentID); ok {
-			if agent.SystemPrompt != "" {
-				systemPrompt = agent.SystemPrompt
-			}
-			if agent.Model != "" {
-				modelName = agent.Model
-			}
-			log.Printf("[Worker] Task %s loaded agent config %s", t.ID, t.AgentID)
-		} else {
-			log.Printf("[Worker] Task %s agent %s not found, fallback to default", t.ID, t.AgentID)
-		}
+	// 运行级成本预算：单次运行模型调用次数上限（防工具乒乓）+ 任务级总上限（跨重试累计）+ token 计量 + CostUSD。
+	// 提前构造，使检索阶段的关联度过滤 LLM 调用同样纳入计量。
+	maxCalls := config.AppConfig.LLM.MaxCallsPerTask
+	if maxCalls <= 0 {
+		maxCalls = 15
+		log.Printf("[Worker] max_calls_per_task not configured, using default %d", maxCalls)
+	}
+	maxTotalCalls := config.AppConfig.LLM.MaxTotalCallsPerTask
+	if maxTotalCalls <= 0 {
+		maxTotalCalls = maxCalls * 2
+		log.Printf("[Worker] max_total_calls_per_task not configured, using default %d", maxTotalCalls)
+	}
+	budget := &llm.Budget{
+		MaxCalls:           maxCalls,
+		MaxTotalCalls:      maxTotalCalls,
+		PriceInUSDPerMTok:  config.AppConfig.LLM.CostPer1MIn,
+		PriceOutUSDPerMTok: config.AppConfig.LLM.CostPer1MOut,
+	}
+	if usageTask, ok := p.manager.GetTask(t.ID); ok {
+		budget.SetBase(usageTask.TotalCalls, usageTask.TotalTokensIn, usageTask.TotalTokensOut)
 	}
 
+	systemPrompt := t.SystemPrompt
 	if systemPrompt == "" {
 		systemPrompt = "你是一个有用的 AI 助手。请尽力解答用户的问题或完成用户指定的任务。"
 	}
 
-	// 动态强化 MCP 工具调用提示词 (如果注入了 mcpClient)
-	if p.mcpClient != nil {
+	// 仅当实际绑定了 internet_search 工具时才注入强制搜索指令，避免模型调用未启用的工具。
+	if p.mcpClient != nil && hasToolName(tools, "internet_search") {
 		systemPrompt += `
 
 [特别指示 - 联网工具强制使用规范]:
@@ -166,19 +708,9 @@ func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) err
 4. 【严格基于结果】：只有当你看到搜索结果后，再依据搜索到的内容整理答案。如果工具真的返回了“未找到结果”，你才可以向用户道歉。`
 	}
 
-	// === RAG 知识库增强 ===
-	if p.ragStore != nil {
-		log.Printf("[Worker] Searching RAG knowledge base for task %s", t.ID)
-		// 检索最相关的 3 个文档片段
-		docs, err := p.ragStore.SimilaritySearch(ctx, t.Payload, 3)
-		if err == nil && len(docs) > 0 {
-			contextStr := ""
-			for i, doc := range docs {
-				contextStr += fmt.Sprintf("片段 %d:\n%s\n\n", i+1, doc.PageContent)
-			}
-
-			// 将检索到的上下文追加到 systemPrompt 中
-			systemPrompt += fmt.Sprintf(`
+	kbContext := p.retrieveKnowledge(ctx, t)
+	if kbContext != "" {
+		systemPrompt += fmt.Sprintf(`
 
 [系统内部提供的本地知识库参考信息]:
 以下是从系统内部知识库中检索到的可能相关的背景信息片段。请优先参考这些信息来回答用户的问题。
@@ -186,23 +718,30 @@ func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) err
 
 <knowledge_base_context>
 %s
-</knowledge_base_context>`, contextStr)
-
-			log.Printf("[Worker] RAG context injected (%d documents found)", len(docs))
-		} else if err != nil {
-			log.Printf("[Worker] RAG search error: %v", err)
-		} else {
-			log.Printf("[Worker] No relevant RAG context found")
-		}
+</knowledge_base_context>`, kbContext)
 	}
-	// ======================
 
-	// === KAG 图谱知识库增强 ===
 	if p.kagManager != nil {
-		log.Printf("[Worker] Searching KAG knowledge graph for task %s", t.ID)
-		kagResult, err := p.kagManager.RetrieveGraphContext(ctx, t.Payload)
+		kagResult, err := p.kagManager.RetrieveGraphContext(ctx, t.Payload, config.AppConfig.Context.GraphTopN)
 		if err == nil && kagResult != "" {
-			systemPrompt += fmt.Sprintf(`
+			// KAG 关联度过滤：仅注入与问题相关的图谱上下文，降低无关实体关系噪声。
+			// 该次判定纳入 budget 计量，避免绕过任务级调用次数与成本上限。
+			if relevant, rerr := p.llmClient.IsContextRelevant(ctx, t.Payload, kagResult, budget); rerr == nil && !relevant {
+				kagResult = ""
+			}
+			// 联合总量约束：图谱上下文与知识库上下文共享 max_context_chars 总量，
+			// 按 RAG 已用剩余量截断，避免两路叠加突破上限。
+			if kagResult != "" {
+				remaining := config.AppConfig.Context.MaxContextChars
+				if remaining > 0 {
+					remaining -= len(kbContext)
+					if remaining <= 0 {
+						kagResult = ""
+					}
+				}
+				if kagResult != "" {
+					kagResult = truncateChunk(kagResult, remaining)
+					systemPrompt += fmt.Sprintf(`
 
 [系统内部提供的本地知识图谱参考信息]:
 以下是从系统内部知识图谱中通过逻辑推理检索到的相关实体关系信息。请优先参考这些确切的关系信息来回答用户的问题。
@@ -211,70 +750,271 @@ func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) err
 <knowledge_graph_context>
 %s
 </knowledge_graph_context>`, kagResult)
-			log.Printf("[Worker] KAG context injected: %s", kagResult)
-		} else if err != nil {
-			log.Printf("[Worker] KAG search error: %v", err)
-		} else {
-			log.Printf("[Worker] No relevant KAG context found")
-		}
-	}
-	// ======================
-
-	var historyMessages []openai.ChatCompletionMessage
-	if t.SessionID != "" {
-		historyTasks := p.manager.GetTaskHistory(t.SessionID, 6)
-		for _, ht := range historyTasks {
-			historyMessages = append(historyMessages, openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleUser,
-				Content: ht.Payload,
-			})
-			if ht.Result != "" {
-				historyMessages = append(historyMessages, openai.ChatCompletionMessage{
-					Role:    openai.ChatMessageRoleAssistant,
-					Content: ht.Result,
-				})
+				}
 			}
 		}
 	}
 
-	// 调用大模型 API (设置 2 分钟超时)
-	apiCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	var historyMessages []openai.ChatCompletionMessage
+	conversationID := t.ConversationID
+	if conversationID == "" {
+		conversationID = t.SessionID // 兼容旧数据：无 ConversationID 时回退 SessionID
+	}
+	if conversationID != "" {
+		// 按 token 预算加载会话历史；当上下文达到窗口阈值时自动压缩较早轮次为摘要。
+		historyMessages = p.loadConversationHistory(ctx, conversationID, systemPrompt, t.Payload)
+	}
+
+	// 可取消 ctx 派生：以 asynq 传入的 ctx 为父（而非 context.Background()），
+	// 并叠加按配置的超时。取消控制指令或 asynq 取消都会中断进行中的 LLM 调用。
+	timeout := 2 * time.Minute
+	if s := config.AppConfig.LLM.TimeoutSeconds; s > 0 {
+		timeout = time.Duration(s) * time.Second
+	}
+	apiCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	p.registerInFlight(t.ID, cancel)
+	defer p.unregisterInFlight(t.ID)
 
-	result, err := p.llmClient.GenerateWithModel(apiCtx, modelName, systemPrompt, historyMessages, t.Payload, p.mcpClient)
+	start := time.Now()
 
-	// 再次检查任务在请求 API 期间是否被取消
+	observer := func(obs llm.ToolCallObservation) {
+		ev := &model.ToolCallEvent{
+			TaskID:    t.ID,
+			TraceID:   t.TraceID,
+			UserID:    t.UserID,
+			AgentID:   t.AgentID,
+			ToolName:  obs.ToolName,
+			Arguments: obs.Arguments,
+			Status:    obs.Status,
+			Result:    obs.Result,
+			Error:     obs.Error,
+			Timestamp: time.Now(),
+		}
+		metrics.ToolCalls.WithLabelValues(obs.Status).Inc()
+		p.manager.PublishToolEvent(ev)
+		if err := p.manager.SaveToolCallLog(&model.ToolCallLog{
+			ID:        uuid.New().String(),
+			TaskID:    t.ID,
+			TraceID:   t.TraceID,
+			UserID:    t.UserID,
+			AgentID:   t.AgentID,
+			ToolName:  obs.ToolName,
+			Arguments: obs.Arguments,
+			Status:    obs.Status,
+			Result:    obs.Result,
+			Error:     obs.Error,
+			CreatedAt: time.Now(),
+		}); err != nil {
+			log.Printf("[Worker][ALERT] failed to persist tool call log for task %s: %v", t.ID, err)
+		}
+	}
+
+	// 支持每个 Agent 指定自己的模型与云厂商接口：优先使用 Agent 配置的 api_key/base_url/model，为空则回退全局默认。
+	var agentAPIKey, agentBaseURL, agentModel string
+	if t.AgentID != "" {
+		if agent, ok := p.manager.GetAgent(t.AgentID); ok {
+			agentAPIKey = agent.APIKey
+			agentBaseURL = agent.BaseURL
+			agentModel = agent.Model
+		}
+	}
+
+	result, err := p.llmClient.GenerateWithToolsAndObserver(apiCtx, agentAPIKey, agentBaseURL, agentModel, systemPrompt, historyMessages, t.Payload, tools, observer, budget)
+
 	checkTask, ok := p.manager.GetTask(t.ID)
 	if ok && checkTask.Status == model.StatusCancelled {
 		log.Printf("[Worker] Task %s was cancelled during API call, aborting", t.ID)
+		p.saveRunLog(&t, model.StatusCancelled, "", budget, start, "cancelled during API call")
 		return nil
 	}
 
 	if err != nil {
+		if errors.Is(err, llm.ErrBudgetExceeded) {
+			// 预算耗尽属不可重试错误：重试只会继续被累计上限拦截，直接置 failed。
+			t.Status = model.StatusFailed
+			t.Error = fmt.Sprintf("budget exceeded: %v", err)
+			p.manager.UpdateTaskIfActive(&t)
+			log.Printf("[Worker] Task %s budget exceeded, permanently failing", t.ID)
+			p.saveRunLog(&t, model.StatusFailed, "", budget, start, t.Error)
+			return nil
+		}
+
 		log.Printf("[Worker] Task %s AI call failed: %v", t.ID, err)
 		if t.Retries < t.MaxRetry {
 			t.Retries++
+			metrics.TaskRetries.Inc()
 			t.Status = model.StatusPending
 			t.Error = fmt.Sprintf("AI API error, retrying %d/%d: %v", t.Retries, t.MaxRetry, err)
-			p.manager.UpdateTask(&t)
-
-			// 返回错误，Asynq 会自动帮我们重试，并且使用指数退避算法
+			if !p.manager.UpdateTaskIfActive(&t) {
+				log.Printf("[Worker] Task %s cancelled concurrently, dropping retry", t.ID)
+				p.saveRunLog(&t, model.StatusCancelled, "", budget, start, t.Error)
+				return nil
+			}
+			p.saveRunLog(&t, model.StatusPending, "", budget, start, t.Error)
 			return err
 		} else {
 			t.Status = model.StatusFailed
 			t.Error = fmt.Sprintf("Failed after %d retries. Last error: %v", t.MaxRetry, err)
-			p.manager.UpdateTask(&t)
+			p.manager.UpdateTaskIfActive(&t)
 			log.Printf("[Worker] Task %s permanently failed", t.ID)
-			return nil // 不再让 Asynq 重试
+			p.saveRunLog(&t, model.StatusFailed, "", budget, start, t.Error)
+			return nil
 		}
 	}
 
-	// 任务处理成功
 	t.Status = model.StatusCompleted
 	t.Result = result
 	t.Error = ""
-	p.manager.UpdateTask(&t)
+	if !p.manager.UpdateTaskIfActive(&t) {
+		log.Printf("[Worker] Task %s cancelled concurrently, dropping result", t.ID)
+		p.saveRunLog(&t, model.StatusCancelled, "", budget, start, "cancelled after completion")
+		return nil
+	}
 	log.Printf("[Worker] Completed task %s successfully", t.ID)
+	p.saveRunLog(&t, model.StatusCompleted, result, budget, start, "")
 
+	return nil
+}
+
+// saveRunLog 累加任务计量并写入一次任务运行的观测记录。
+func (p *Pool) saveRunLog(t *model.Task, status model.TaskStatus, result string, budget *llm.Budget, start time.Time, errMsg string) {
+	// 跨重试累计：把本次运行的调用/token 计量原子累加到任务累计字段。
+	p.manager.AccumulateTaskUsage(t.ID, budget.Calls, budget.TokensIn, budget.TokensOut)
+
+	// Prometheus 指标：任务状态/耗时、模型调用/token/成本（task:process 队列）。
+	statusStr := string(status)
+	metrics.TaskTotal.WithLabelValues(statusStr).Inc()
+	metrics.TaskDuration.WithLabelValues(statusStr).Observe(time.Since(start).Seconds())
+	metrics.LLMCalls.WithLabelValues("task:process").Add(float64(budget.Calls))
+	metrics.LLMTokens.WithLabelValues("task:process", "in").Add(float64(budget.TokensIn))
+	metrics.LLMTokens.WithLabelValues("task:process", "out").Add(float64(budget.TokensOut))
+	metrics.LLMCost.WithLabelValues("task:process").Add(budget.CostUSD())
+
+	modelName := config.AppConfig.LLM.Model
+	if t.AgentID != "" {
+		if agent, ok := p.manager.GetAgent(t.AgentID); ok && agent.Model != "" {
+			modelName = agent.Model
+		}
+	}
+	if err := p.manager.SaveRunLog(&model.RunLog{
+		ID:        uuid.New().String(),
+		TaskID:    t.ID,
+		TraceID:   t.TraceID,
+		UserID:    t.UserID,
+		AgentID:   t.AgentID,
+		Model:     modelName,
+		Status:    string(status),
+		Calls:     budget.Calls,
+		TokensIn:  budget.TokensIn,
+		TokensOut: budget.TokensOut,
+		CostUSD:   budget.CostUSD(),
+		Duration:  time.Since(start).Milliseconds(),
+		Error:     errMsg,
+		CreatedAt: time.Now(),
+	}); err != nil {
+		log.Printf("[Worker][ALERT] failed to persist run log for task %s: %v", t.ID, err)
+	}
+}
+
+// handleKBBuild 处理知识库文档异步构建任务。
+func (p *Pool) handleKBBuild(ctx context.Context, t *asynq.Task) error {
+	var payload struct {
+		KBID  string `json:"kb_id"`
+		DocID string `json:"doc_id"`
+	}
+	if err := json.Unmarshal(t.Payload(), &payload); err != nil {
+		return fmt.Errorf("invalid kb:build payload: %w", err)
+	}
+
+	doc, ok := p.manager.GetDocument(payload.DocID)
+	if !ok {
+		return fmt.Errorf("document %s not found", payload.DocID)
+	}
+
+	// 记录构建前的状态，用于避免文档重建时重复累加 kb.doc_count。
+	wasReady := doc.Status == "ready"
+
+	doc.Status = "processing"
+	_ = p.manager.UpdateDocument(doc)
+
+	if p.ragStore == nil {
+		doc.Status = "failed"
+		_ = p.manager.UpdateDocument(doc)
+		metrics.KBBuildTotal.WithLabelValues("failed").Inc()
+		return fmt.Errorf("rag store unavailable")
+	}
+
+	// 构建期生成 per-doc 摘要（摘要层），供运行期渐进式披露注入，避免运行期临时调 LLM 生成摘要。
+	if doc.Summary == "" {
+		summaryCtx, summaryCancel := context.WithTimeout(ctx, 2*time.Minute)
+		sumBudget := &llm.Budget{
+			PriceInUSDPerMTok:  config.AppConfig.LLM.CostPer1MIn,
+			PriceOutUSDPerMTok: config.AppConfig.LLM.CostPer1MOut,
+		}
+		summary, serr := p.llmClient.SummarizeText(summaryCtx, doc.Content, sumBudget)
+		summaryCancel()
+		// 计量 kb:build 队列成本（LLM 摘要），与 task:process 队列分开观测。
+		metrics.LLMCalls.WithLabelValues("kb:build").Add(float64(sumBudget.Calls))
+		metrics.LLMTokens.WithLabelValues("kb:build", "in").Add(float64(sumBudget.TokensIn))
+		metrics.LLMTokens.WithLabelValues("kb:build", "out").Add(float64(sumBudget.TokensOut))
+		metrics.LLMCost.WithLabelValues("kb:build").Add(sumBudget.CostUSD())
+		if serr != nil {
+			log.Printf("[Worker][ALERT] failed to summarize document %s: %v", doc.ID, serr)
+			// 摘要生成失败不阻断入库：仅缺失摘要层，命中层仍可用。
+		} else {
+			doc.Summary = summary
+		}
+	}
+
+	splitter := textsplitter.NewRecursiveCharacter()
+	splitter.ChunkSize = 500
+	splitter.ChunkOverlap = 50
+
+	chunks, err := textsplitter.SplitDocuments(splitter, []schema.Document{
+		{
+			PageContent: doc.Content,
+			Metadata: map[string]any{
+				"kb_id":  payload.KBID,
+				"doc_id": doc.ID,
+			},
+		},
+	})
+	if err != nil {
+		doc.Status = "failed"
+		_ = p.manager.UpdateDocument(doc)
+		metrics.KBBuildTotal.WithLabelValues("failed").Inc()
+		return err
+	}
+
+	// 为每个 chunk 打上其在原文档中的有序位置序号（chunk_index），
+	// 供运行期按 doc_id + chunk_index 做窗口扩展（上下文感知分块 B1 主路径）。
+	for i := range chunks {
+		if chunks[i].Metadata == nil {
+			chunks[i].Metadata = map[string]any{}
+		}
+		chunks[i].Metadata["chunk_index"] = i
+	}
+
+	if _, err := p.ragStore.AddDocuments(ctx, chunks); err != nil {
+		doc.Status = "failed"
+		_ = p.manager.UpdateDocument(doc)
+		metrics.KBBuildTotal.WithLabelValues("failed").Inc()
+		return err
+	}
+
+	doc.Status = "ready"
+	doc.ChunkCount = len(chunks)
+	_ = p.manager.UpdateDocument(doc)
+	metrics.KBBuildTotal.WithLabelValues("ready").Inc()
+
+	// 原子自增文档计数（避免读-改-写竞态导致并发丢失更新）；文档重建时通过 wasReady 防止重复累加。
+	if !wasReady {
+		if !p.manager.IncrementKnowledgeBaseDocCount(payload.KBID) {
+			log.Printf("[Worker] KB %s not found while incrementing doc_count", payload.KBID)
+		}
+	}
+
+	log.Printf("[Worker] KB %s document %s built with %d chunks", payload.KBID, payload.DocID, len(chunks))
 	return nil
 }

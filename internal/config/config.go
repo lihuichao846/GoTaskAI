@@ -11,12 +11,25 @@ import (
 )
 
 type Config struct {
-	Server ServerConfig `mapstructure:"server"`
-	MySQL  MySQLConfig  `mapstructure:"mysql"`
-	Redis  RedisConfig  `mapstructure:"redis"`
-	Neo4j  Neo4jConfig  `mapstructure:"neo4j"`
-	Queue  QueueConfig  `mapstructure:"queue"`
-	LLM    LLMConfig    `mapstructure:"llm"`
+	Server   ServerConfig   `mapstructure:"server"`
+	MySQL    MySQLConfig    `mapstructure:"mysql"`
+	Redis    RedisConfig    `mapstructure:"redis"`
+	EventBus EventBusConfig `mapstructure:"eventbus"`
+	Neo4j    Neo4jConfig    `mapstructure:"neo4j"`
+	Queue    QueueConfig    `mapstructure:"queue"`
+	LLM      LLMConfig      `mapstructure:"llm"`
+	Rerank   RerankConfig   `mapstructure:"rerank"`
+	Compress CompressConfig `mapstructure:"compress"`
+	Context  ContextConfig  `mapstructure:"context"`
+	Metrics  MetricsConfig  `mapstructure:"metrics"`
+	Milvus   MilvusConfig   `mapstructure:"milvus"`
+}
+
+// EventBusConfig 配置 Worker 与 API 之间实时事件的独立消息通道（NATS）。
+type EventBusConfig struct {
+	Enabled   bool   `mapstructure:"enabled"`
+	URL       string `mapstructure:"url"`       // NATS 地址，如 nats://0.0.0.0:4222
+	Embedded  bool   `mapstructure:"embedded"`  // 是否在本进程内嵌启动 nats-server（仅 API 进程设置为 true）
 }
 
 type ServerConfig struct {
@@ -43,36 +56,89 @@ func (c RedisConfig) UseSentinel() bool {
 	return strings.EqualFold(strings.TrimSpace(c.Mode), "sentinel")
 }
 
-// VectorStoreURL returns a direct redis:// URL for components that do not use
-// sentinel discovery and still require a direct Redis endpoint.
-func (c RedisConfig) VectorStoreURL() string {
-	addr := strings.TrimSpace(c.Addr)
-	if addr == "" {
-		return ""
-	}
-	if strings.HasPrefix(addr, "redis://") || strings.HasPrefix(addr, "rediss://") {
-		return addr
-	}
-	return "redis://" + addr
-}
-
 type Neo4jConfig struct {
 	URI      string `mapstructure:"uri"`
 	Username string `mapstructure:"username"`
 	Password string `mapstructure:"password"`
 }
 
+type MilvusConfig struct {
+	Host           string `mapstructure:"host"`
+	Port           int    `mapstructure:"port"`
+	CollectionName string `mapstructure:"collection_name"`
+	Dim            int    `mapstructure:"dim"`
+}
+
 type QueueConfig struct {
-	Capacity int `mapstructure:"capacity"`
-	Workers  int `mapstructure:"workers"`
+	Capacity  int `mapstructure:"capacity"`
+	Workers   int `mapstructure:"workers"`
 	Processes int `mapstructure:"processes"`
 }
 
 type LLMConfig struct {
-	APIKey         string `mapstructure:"api_key"`
-	BaseURL        string `mapstructure:"base_url"`
-	Model          string `mapstructure:"model"`
-	EmbeddingModel string `mapstructure:"embedding_model"`
+	APIKey           string `mapstructure:"api_key"`
+	BaseURL          string `mapstructure:"base_url"`
+	Model            string `mapstructure:"model"`
+	EmbeddingModel   string `mapstructure:"embedding_model"`
+	EmbeddingAPIKey  string `mapstructure:"embedding_api_key"`
+	EmbeddingBaseURL string `mapstructure:"embedding_base_url"`
+	// TimeoutSeconds 为单次 LLM 调用超时（秒），<=0 时回退到默认 120 秒。
+	TimeoutSeconds int `mapstructure:"timeout_seconds"`
+	// MaxCallsPerTask 为单个任务单次运行允许的最大模型调用次数（防工具乒乓），<=0 时由 worker 兜底为默认值。
+	MaxCallsPerTask int `mapstructure:"max_calls_per_task"`
+	// MaxTotalCallsPerTask 为单个任务跨重试累计允许的最大模型调用次数，<=0 时由 worker 兜底为默认值。
+	MaxTotalCallsPerTask int `mapstructure:"max_total_calls_per_task"`
+	// CostPer1MIn / CostPer1MOut 为模型输入/输出单价（美元 / 百万 token），用于 CostUSD 折算，未配置为 0。
+	CostPer1MIn  float64 `mapstructure:"cost_per_1m_in"`
+	CostPer1MOut float64 `mapstructure:"cost_per_1m_out"`
+	// ContextWindow 为当前对话模型支持的上下文窗口（token 数），用于判断何时触发上下文压缩。
+	ContextWindow int `mapstructure:"context_window"`
+	// CompressThreshold 为触发压缩的占用比例（如 0.7 表示上下文达到窗口 70% 时压缩）。
+	CompressThreshold float64 `mapstructure:"compress_threshold"`
+}
+
+// CompressConfig 为对话上下文自动压缩（摘要）提供配置。
+type CompressConfig struct {
+	Enabled    bool `mapstructure:"enabled"`
+	MaxHistory int  `mapstructure:"max_history"` // 单次任务最多加载的历史轮数
+	KeepRecent int  `mapstructure:"keep_recent"` // 压缩时保留下来的最近原始消息轮数
+	MinTurns   int  `mapstructure:"min_turns"`   // 历史轮数少于该值时不做压缩
+}
+
+// RerankConfig 为召回重排（rerank）提供配置，默认指向阿里云百炼 DashScope 的 qwen3-rerank 云端接口。
+type RerankConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	BaseURL string `mapstructure:"base_url"`
+	APIKey  string `mapstructure:"api_key"`
+	Model   string `mapstructure:"model"`
+	TopN    int    `mapstructure:"top_n"`
+}
+
+// MetricsConfig 为 Prometheus /metrics 端点配置。
+type MetricsConfig struct {
+	// Port 为 Worker 子进程 /metrics 监听基础端口（子进程实际使用 Port + childIndex + 1）。
+	// API 进程的 /metrics 挂载在 server.port 上，不使用本端口。
+	Port int `mapstructure:"port"`
+}
+
+// ContextConfig 控制知识库上下文的渐进式披露（目标五）：
+// 通过摘要层、命中片段截断与总量上限，在知识量大时压低注入上下文体积。
+type ContextConfig struct {
+	// MaxChunkChars 为单个命中片段的最大注入字符数，超长截断；<=0 不截断。
+	MaxChunkChars int `mapstructure:"max_chunk_chars"`
+	// MaxContextChars 为知识上下文（含摘要层与命中层）的总字符数上限；<=0 不限制。
+	MaxContextChars int `mapstructure:"max_context_chars"`
+	// RagScoreThreshold 为 RAG 分层阈值（分数已 min-max 归一化到 [0,1]，最低分=0、最高分=1）：
+	// Score >= 阈值注入全文，否则降级为短截断；<=0 不启用分层。
+	RagScoreThreshold float32 `mapstructure:"rag_score_threshold"`
+	// GraphTopN 为 KAG 图谱检索注入的命中关系条数上限；<=0 不限制。
+	GraphTopN int `mapstructure:"graph_top_n"`
+	// ChunkContextWindow 为上下文感知分块（B1）窗口大小：
+	// 命中块前后各扩展的相邻块数；<=0 关闭窗口扩展（等价改造前行为）。默认 1。
+	ChunkContextWindow int `mapstructure:"chunk_context_window"`
+	// EnableParentContext 控制是否启用上一级文档上下文兜底（B1 扩展失败/存量缺 chunk_index 时，
+	// 回退为 Document.Content 全文）。默认 true。
+	EnableParentContext bool `mapstructure:"enable_parent_context"`
 }
 
 var AppConfig Config

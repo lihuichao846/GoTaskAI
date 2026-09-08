@@ -1,33 +1,63 @@
 package api
 
 import (
+	"context"
+	"fmt"
+	"log"
 	"net/http"
 
 	"gotaskai/internal/config"
 	"gotaskai/internal/pkg/kag"
 	"gotaskai/internal/pkg/llm"
+	"gotaskai/internal/pkg/ragstore"
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"github.com/tmc/langchaingo/embeddings"
-	"github.com/tmc/langchaingo/llms/ollama"
 	"github.com/tmc/langchaingo/schema"
 	"github.com/tmc/langchaingo/textsplitter"
-	"github.com/tmc/langchaingo/vectorstores/redisvector"
 )
 
 type RAGHandler struct {
 	rdb        *redis.Client
 	llmClient  *llm.Client // 保留以兼容其他可能的方法
 	kagManager *kag.KAGManager
+	ragStore   *ragstore.Store
 }
 
 func NewRAGHandler(rdb *redis.Client, kagManager *kag.KAGManager) *RAGHandler {
-	return &RAGHandler{
+	h := &RAGHandler{
 		rdb:        rdb,
 		llmClient:  llm.NewClient(),
 		kagManager: kagManager,
 	}
+
+	mc := config.AppConfig.Milvus
+	if mc.Host == "" {
+		return h
+	}
+	emb, err := newEmbedder()
+	if err != nil {
+		log.Printf("Failed to init ollama embedder for RAG handler: %v", err)
+		return h
+	}
+	store, serr := ragstore.New(context.Background(), ragstore.Config{
+		Address:        fmt.Sprintf("%s:%d", mc.Host, mc.Port),
+		CollectionName: mc.CollectionName,
+		Dim:            mc.Dim,
+		Embedder:       emb,
+	})
+	if serr != nil {
+		log.Printf("Failed to init Milvus ragstore for RAG handler: %v", serr)
+		return h
+	}
+	h.ragStore = store
+	return h
+}
+
+// newEmbedder 构建基于阿里百炼 DashScope（Qwen3-Embedding）的文本嵌入器。
+func newEmbedder() (embeddings.Embedder, error) {
+	return llm.NewEmbedder()
 }
 
 // IngestRequest 定义上传知识库文档的请求体
@@ -83,22 +113,12 @@ func (h *RAGHandler) Ingest(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// 1. 初始化 Ollama Embedder
-	llm, err := ollama.New(
-		ollama.WithServerURL("http://localhost:11434"),
-		ollama.WithModel("bge-m3"),
-	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "初始化模型失败", "details": err.Error()})
-		return
-	}
-	embedder, err := embeddings.NewEmbedder(llm)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "初始化 Embedder 失败", "details": err.Error()})
+	if h.ragStore == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "知识库未初始化（Milvus 未连接）"})
 		return
 	}
 
-	// 2. 包装文档内容
+	// 1. 包装文档内容
 	doc := schema.Document{
 		PageContent: req.Content,
 		Metadata: map[string]any{
@@ -106,7 +126,7 @@ func (h *RAGHandler) Ingest(c *gin.Context) {
 		},
 	}
 
-	// 3. 智能分块
+	// 2. 智能分块
 	splitter := textsplitter.NewRecursiveCharacter()
 	splitter.ChunkSize = 500
 	splitter.ChunkOverlap = 50
@@ -117,26 +137,17 @@ func (h *RAGHandler) Ingest(c *gin.Context) {
 		return
 	}
 
-	// 4. 初始化 Redis 向量存储连接
-	redisURL := config.AppConfig.Redis.VectorStoreURL()
-	if redisURL == "" {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "RedisVector 需要配置 redis.addr 直连地址"})
-		return
+	// 为每个 chunk 打上其在原文档中的有序位置序号（chunk_index），
+	// 与 Worker 侧 handleKBBuild 保持一致，供运行期窗口扩展（B1 主路径）。
+	for i := range chunks {
+		if chunks[i].Metadata == nil {
+			chunks[i].Metadata = map[string]any{}
+		}
+		chunks[i].Metadata["chunk_index"] = i
 	}
 
-	store, err := redisvector.New(
-		ctx,
-		redisvector.WithConnectionURL(redisURL),
-		redisvector.WithIndexName("idx:pangu_v2", true),
-		redisvector.WithEmbedder(embedder),
-	)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "初始化 Redis 向量库失败", "details": err.Error()})
-		return
-	}
-
-	// 5. 向量化并入库
-	_, err = store.AddDocuments(ctx, chunks)
+	// 3. 向量化并入库（dense + sparse 双路写入）
+	n, err := h.ragStore.AddDocuments(ctx, chunks)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "向量数据入库失败", "details": err.Error()})
 		return
@@ -145,6 +156,6 @@ func (h *RAGHandler) Ingest(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message": "知识库构建成功",
 		"total":   len(chunks),
-		"success": len(chunks), // LangChainGo 的 AddDocuments 要么全成功要么报错
+		"success": n,
 	})
 }
