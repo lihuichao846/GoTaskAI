@@ -20,7 +20,7 @@
   - **任务消费**: 监听 Redis 中的 Asynq 队列，按照高/中/低优先级抢占执行任务。
   - **AI 核心逻辑**: 执行大模型 API 调用、基于 Neo4j 的 KAG 图谱检索以及 Redis 向量检索。
   - **工具调用**: 集成 MCP (Model Context Protocol) 客户端，动态调用外部工具（如联网搜索插件）。
-  - **状态反馈**: 任务执行期间及完成后，将状态更新写入数据库，并通过 Redis 事件总线广播。
+  - **状态反馈**: 任务执行期间及完成后，将状态更新写入数据库，并经独立 NATS 事件总线广播。
 
 ## 3. 微服务通信与协同机制
 
@@ -30,11 +30,11 @@
 - **方向**: API Server -> Worker Node
 - **机制**: API Server 作为 Producer，将任务持久化到 Redis 队列。Worker 作为 Consumer 异步安全地拉取处理。这实现了完美的**流量削峰**。
 
-### 3.2 跨进程事件总线 (Redis Pub/Sub + SSE)
+### 3.2 跨进程事件总线 (NATS + SSE)
 - **方向**: Worker Node -> API Server -> Client
 - **机制**: 
-  1. Worker 节点在执行任务（如生成 AI 文本流）时，向 Redis 的特定 Channel 发布消息（Pub）。
-  2. API Server 一直在订阅该 Channel（Sub），以此跨进程实时获取 Worker 的工作进度。
+  1. Worker 节点在执行任务（如生成 AI 文本流）时，经独立 NATS 主题发布事件（Publish）。
+  2. API Server 一直在订阅该主题（Subscribe），以此跨进程实时获取 Worker 的工作进度。
   3. API Server 将获取到的数据，通过 SSE 流推送给对应的浏览器客户端，实现跨进程的实时无缝通信。
 
 ### 3.3 同步控制通道 (gRPC)

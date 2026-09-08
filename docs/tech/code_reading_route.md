@@ -11,7 +11,7 @@
 3. 然后看认证和鉴权是如何落地的。
 4. 再看任务如何从 HTTP 请求变成 Redis 队列任务。
 5. 再看 Worker 如何消费任务、调用 LLM、处理失败与重试。
-6. 再看状态更新如何通过 Redis Pub/Sub + SSE 实时推给前端。
+6. 再看状态更新如何通过 NATS + SSE 实时推给前端。
 7. 再看 RAG 和 KAG 是怎样插入到 Worker 主链路里的。
 8. 最后再看前端，因为前端本质上主要是在展示后端主链路的状态和结果。
 
@@ -29,7 +29,8 @@
    - 由 Worker 连接，用于外部工具调用，例如联网搜索。
 4. 基础设施
    - `MySQL`：持久化用户和任务数据。
-   - `Redis`：同时承担缓存、Asynq 队列、Pub/Sub 事件总线。
+   - `Redis`：承担缓存 + Asynq 队列（不再承担事件广播）。
+   - `NATS`：独立承担跨进程实时事件总线。
    - `Neo4j`：承载 KAG 图谱数据。
    - `Ollama` / OpenAI 兼容模型服务：承载向量化和大模型推理。
 
@@ -37,7 +38,7 @@
 
 ```text
 前端 -> API Server -> MySQL/Redis/Asynq -> Worker Node -> LLM/RAG/KAG
-                                      -> Redis Pub/Sub -> API SSE -> 前端
+                                      -> NATS -> API SSE -> 前端
 ```
 
 ## 总阅读顺序
@@ -56,7 +57,7 @@
 - API 和 Worker 是不是两个独立进程？
 - 配置文件从哪里加载？
 - 前端是 API 托管还是独立部署？
-- Redis 在项目里到底承担了几种角色？
+- Redis 与 NATS 在项目里到底分别承担什么角色？
 
 ### 第 2 步：看 API Server 怎么启动，路由是怎么挂上的
 
@@ -166,7 +167,7 @@
 
 这一步看完后，应该能真正理解项目最核心的“异步执行”机制。
 
-### 第 6 步：看状态更新为什么能实时推给前端，SSE + Redis Pub/Sub 是怎么串起来的
+### 第 6 步：看状态更新为什么能实时推给前端，SSE + NATS 是怎么串起来的
 
 建议重点看：
 
@@ -178,8 +179,8 @@
 1. 前端调用 `/api/tasks/stream?token=...` 建立 SSE 长连接。
 2. API 进程里通过 `manager.Subscribe(userID)` 给当前用户挂一个本地 channel。
 3. Worker 完成任务后调用 `manager.UpdateTask()`。
-4. `UpdateTask()` 不只更新 MySQL 和 Redis，还会往 Redis Pub/Sub 的 `global_task_updates` 频道发消息。
-5. API 进程里的 `listenForGlobalUpdates()` 一直订阅这个频道。
+4. `UpdateTask()` 不只更新 MySQL 和 Redis，还会经 NATS 发布 `global_task_updates` 事件。
+5. API 进程里的 `listenForGlobalUpdates()` 一直订阅这个 NATS 主题。
 6. API 收到消息后调用 `broadcast()`，把更新扔到当前用户对应的 channel。
 7. `StreamTasks()` 从 channel 取到任务更新，再用 `c.SSEvent()` 推给前端。
 
@@ -187,7 +188,7 @@
 
 一句话概括就是：
 
-`Worker 不直接连前端，而是先发 Redis Pub/Sub；API 再把消息转成 SSE 推给浏览器。`
+`Worker 不直接连前端，而是先发 NATS 事件；API 再把消息转成 SSE 推给浏览器。`
 
 ### 第 7 步：看 RAG 和 KAG 是在 Worker 里怎么插进去的
 
@@ -262,8 +263,8 @@
 
 1. 这是一个双进程后端项目：`API Server + Worker Node`。
 2. API 负责接客，Worker 负责干重活。
-3. Redis 在这个项目里同时扮演缓存、消息队列和事件总线三个角色。
-4. SSE 能实时更新，不是因为 Worker 直接推前端，而是因为 `Worker -> Redis Pub/Sub -> API -> SSE -> 浏览器` 这条链路成立。
+3. Redis 在这个项目里承担缓存与 Asynq 队列两条核心链路，跨进程实时事件则由独立 NATS 通道承担。
+4. SSE 能实时更新，不是因为 Worker 直接推前端，而是因为 `Worker -> NATS -> API -> SSE -> 浏览器` 这条链路成立。
 
 ## 后续继续深入时的建议起点
 

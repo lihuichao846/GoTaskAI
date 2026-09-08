@@ -43,13 +43,13 @@
 
 在单体架构时，API 和 Worker 在同一个内存里，Worker 干完活直接调个函数，API 就能把进度推给前端。但现在它们变成了两个独立的 `.exe` 程序，它们之间怎么通信呢？
 
-**解决方案：基于 Redis Pub/Sub 的跨进程事件总线**
+**解决方案：基于 NATS 的跨进程事件总线**
 
 1. **API Server 的监听**：
-   在 `cmd/api` 启动时，`TaskManager` 开启了一个后台协程 `listenForGlobalUpdates()`。它像个接线员一样，死死盯住 Redis 里的一个专属频道 `global_task_updates`。
+   在 `cmd/api` 启动时，`TaskManager` 开启了一个后台协程 `listenForGlobalUpdates()`。它像个接线员一样，死死盯住 NATS 里的一个专属主题 `global_task_updates`。
 2. **Worker Node 的广播**：
-   当 `cmd/worker` 里的某个任务跑到一半，或者彻底跑完把结果存进 MySQL 时，它会调用 `manager.UpdateTask()`。在这个方法里，Worker 会把最新的任务状态（包含大模型的最终回答）打包成 JSON，通过 `rdb.Publish()` 发射到 Redis 的那个频道里。
+   当 `cmd/worker` 里的某个任务跑到一半，或者彻底跑完把结果存进 MySQL 时，它会调用 `manager.UpdateTask()`。在这个方法里，Worker 会把最新的任务状态（包含大模型的最终回答）打包成 JSON，通过 `eventBus.PublishJSON()` 发射到 NATS 的那个主题里。
 3. **API 接收并推送给前端**：
    API Server 的接线员立刻捕获到了这条消息，它一看：“哟，这是张三的任务更新了！” 于是它顺着自己内存里维护的 SSE 管道，把这个结果立刻推给了张三的浏览器。
 
-这就是微服务中非常经典的**“事件驱动解耦 (Event-Driven Architecture)”**。API Server 完全不需要知道 Worker Node 是部署在北京的机房还是上海的机房，有 1 台还是 100 台，它们只通过 Redis 这个中间人进行解耦交流，实现了极致的高可用和可扩展性。
+这就是微服务中非常经典的**“事件驱动解耦 (Event-Driven Architecture)”**。API Server 完全不需要知道 Worker Node 是部署在北京的机房还是上海的机房，有 1 台还是 100 台，它们只通过 NATS 这个中间人进行解耦交流，实现了极致的高可用和可扩展性。

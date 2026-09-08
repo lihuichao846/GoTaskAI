@@ -41,17 +41,17 @@
                 │ ① 任务入队（Asynq）
                 ▼
         ┌──────── Redis ────────┐
-        │ 缓存 + 队列 + Pub/Sub   │
+        │ 缓存 + Asynq 队列       │
         └────────┬───────┬──────┘
-                 │       │ ③ 状态广播
+                 │       │ （事件不再走 Redis）
        ② 消费任务 │       └───────────────┐
                  ▼                        ▼
-┌────────────── Worker Node ──────────────┐
-│  dispatch → 加载 Agent 配置              │
-│  → 解析工具（Tool Registry）             │
-│  → 挂载知识库（RAG/KAG）                 │
-│  → LLM 工具调用循环 → 回写 + 观测        │
-└───────────────┬────────────────────────┘
+┌────────────── Worker Node ──────────────┐        ┌────── NATS ──────┐
+│  dispatch → 加载 Agent 配置              │  ③ 状态→  │  跨进程实时事件总线  │
+│  → 解析工具（Tool Registry）             │────发布──▶│  任务/工具事件      │
+│  → 挂载知识库（RAG/KAG）                 │           └────────┬───────┘
+│  → LLM 工具调用循环 → 回写 + 观测        │  ④ SSE    └───────▶ API Server
+└───────────────┬────────────────────────┘            （SSE 推给前端）
                 │ ④ 日志/指标/追踪
                 ▼
         ┌── 可观测性 ──┐
@@ -59,7 +59,7 @@
         │ + Prometheus │
         └──────────────┘
 
-外部依赖：MySQL / Redis(向量+队列+总线) / Neo4j / 对象存储 / Ollama / MCP 工具子进程
+外部依赖：MySQL / Redis(向量+缓存+队列) / NATS(事件总线) / Neo4j / 对象存储 / Ollama / MCP 工具子进程
 ```
 
 **关键变化**：Worker 的 `handleTaskProcess` 从「写死 LLM 逻辑」改为「按 Agent 配置动态组装」，但调度骨架（入队、消费、重试、状态回写、SSE）完全不变。
@@ -250,7 +250,7 @@ handleTaskProcess(task)
   ├─ 5. 拼装历史会话（复用 GetTaskHistory）
   ├─ 6. LLM 工具调用循环（复用 llm.Client.Generate）
   ├─ 7. 回写结果 + RunLog + ToolCallLog + Token 用量
-  └─ 8. UpdateTask → Redis Pub/Sub → SSE
+  └─ 8. UpdateTask → NATS → SSE
 ```
 
 ### 6.1 Agent 配置加载与热加载
@@ -310,7 +310,7 @@ type ToolRegistry struct {
       分块(500/50) → embedding(bge-m3) → 写 RedisVector
       → （hybrid 类型）LLM 抽三元组 → 写 Neo4j
       → Document 状态 = ready，KB.DocCount+1
-  → 构建完成 → Pub/Sub → 前端刷新状态
+  → 构建完成 → NATS → 前端刷新状态
 ```
 
 - **幂等**：文档以 `content hash` 去重，重复上传同一内容不重复构建。
@@ -329,7 +329,7 @@ type ToolRegistry struct {
 
 ## 10. 流式推送（SSE）
 
-- 复用现有 `StreamTasks` + Redis Pub/Sub 链路，**无需改动**。
+- 复用现有 `StreamTasks` + NATS 链路，**无需改动**。
 - 增强点：事件区分类型（`task_update` / `token_stream` / `tool_call`），让前端能展示「工具调用过程」和「打字机效果」。
 - 现实考量：SSE 是单向，若未来要「用户在生成中打断」，配合现有 gRPC `CancelTask` 即可。
 
@@ -441,3 +441,81 @@ LLM 成本是 Agent 平台最大的隐性成本，必须显式治理：
 ## 19. 一句话总结演进价值
 
 > 从「我会把一堆 AI 技术串起来」升级为「我设计了一个可运营、可扩展、可控成本的 Agent 基础设施平台」，后端调度/多租户/安全/成本这些工程能力成为项目的真正壁垒。
+
+---
+
+## 20. 本轮落地执行流程（数据模型演进）
+
+> 本章记录从「任务对话中心」向「Agent 平台」演进时，底层数据模型的具体改造顺序与当前进展。前文第 4 节为完整目标结构，本章聚焦**执行路径**，避免一步到位式的大迁移。
+
+### 20.1 现状基线（已就绪的部分）
+
+- [Agent](file:///d:/Program%20Files/GoTaskAI/internal/model/agent.go) 已是独立表，具备 `ID / UserID / Name / SystemPrompt / Model / Status / 时间`。
+- [Task](file:///d:/Program%20Files/GoTaskAI/internal/model/task.go) 已有 `AgentID` 字段，`RunAgent` 会写入 `AgentID`，Worker 会按 `AgentID` 加载 Agent 的 `system_prompt`。
+- 前端工作台已从「会话列表 + 对话」改为「Agent 列表 + 对话」，发送走 `POST /api/agents/:id/run`。
+
+**结论**：最小适配（Agent 表 + Task.AgentID）已完成，不需要为「绑定 Agent」再动表结构。
+
+### 20.2 仍需补齐的数据缺口
+
+| 缺口 | 现状 | 影响 |
+|---|---|---|
+| 会话不是实体 | 仅靠 `Task.SessionID` 字符串隐式关联 | 无法管理会话标题、归属 Agent、独立生命周期 |
+| 无工具表 | 仅 [mcpclient](file:///d:/Program%20Files/GoTaskAI/internal/pkg/mcpclient/client.go) 单工具 | 撑不起「工具平台」 |
+| 无知识库表 | RAG/KAG 逻辑存在，但无持久化实体 | 无法按 Agent 绑定知识库 |
+| Task 职责偏重 | 同时承载「对话消息」与「后台任务」 | 语义混叠，长期需拆分 |
+
+### 20.3 目标数据模型（增量）
+
+在现有 `User / Agent / Task` 基础上新增：
+
+```text
+User 1 ──── N Conversation
+Agent 1 ─── N Conversation
+Conversation 1 ─ N Task
+
+Agent N ──── N Tool          (通过 AgentTool)
+Agent N ──── N KnowledgeBase (通过 AgentKnowledge)
+```
+
+新增表：
+
+- `Conversation`：`ID / UserID / AgentID / Title / CreatedAt / UpdatedAt`
+- `Tool`、`KnowledgeBase`、`AgentTool`、`AgentKnowledge`（结构见第 4.2 节）
+- `Task` 增加 `ConversationID`，逐步替代 `SessionID` 字符串。
+
+### 20.4 实现流程（5 阶段）
+
+**阶段 1：定义模型 + 迁移（纯后端）**
+- 在 [internal/model](file:///d:/Program%20Files/GoTaskAI/internal/model) 新增 `conversation.go`、`tool.go`、`knowledge_base.go` 及关联表结构。
+- 给 [Task](file:///d:/Program%20Files/GoTaskAI/internal/model/task.go) 加 `ConversationID`。
+- 在 [cmd/api/main.go](file:///d:/Program%20Files/GoTaskAI/cmd/api/main.go) 的 `AutoMigrate` 注册新表。
+- 兼容策略：保留 `SessionID`，用回填脚本把旧 `SessionID` 迁移为 `Conversation` 记录。
+
+**阶段 2：数据访问层（CRUD）**
+- 在 [manager.go](file:///d:/Program%20Files/GoTaskAI/internal/queue/manager.go) 或拆出 `ConversationManager / ToolManager / KnowledgeManager`。
+- `RunAgent` / `SubmitTask` 从「直接写 SessionID」改为「查找或创建 Conversation，再写 ConversationID」。
+
+**阶段 3：API 层**
+- 新增 `/api/conversations`、`/api/tools`、`/api/knowledge-bases` 及 `/api/agents/:id/tools`、`/api/agents/:id/knowledge-bases` 路由。
+- 保持现有 `/api/tasks`、`/api/agents` 兼容。
+
+**阶段 4：Worker 适配**
+- [pool.go](file:///d:/Program%20Files/GoTaskAI/internal/worker/pool.go) 的多轮上下文按 `ConversationID` 拉取。
+- 运行 Agent 时加载其绑定的工具 / 知识库，完成「工具平台」闭环。
+
+**阶段 5：前端联动**
+- 工作台「Agent 列表 + 对话」对接 `/api/conversations`。
+- 「工具」「知识库」占位面板对接真实接口。
+- 任务中心弱化为「原始任务查询」，不再作为中心入口。
+
+### 20.5 推荐落地顺序
+
+1. 先做「阶段 1 + 阶段 2 的 Conversation 部分 + 阶段 5 的工作台对接」，直接呼应工作台已改为 Agent 对话的方向。
+2. 下一轮再补「工具 / 知识库」表与接口。
+
+### 20.6 当前进展记录
+
+- 已完成：前端工作台由「会话列表 + 对话」改为「Agent 列表 + 对话」，输入区通过 `runAgent` 绑定 Agent。
+- 已完成：任务中心与工作台去重，删减重叠的会话任务列表。
+- 待办：数据模型阶段 1（`Conversation` 表 + `Task.ConversationID` 迁移）。
