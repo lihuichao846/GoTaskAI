@@ -28,6 +28,12 @@ function submit() {
 
   emit(isLoginMode.value ? 'login' : 'register', payload)
 }
+
+// 切换登录/注册模式时清空密码，避免上一次输入残留导致登录失败。
+function toggleMode() {
+  isLoginMode.value = !isLoginMode.value
+  form.password = ''
+}
 </script>
 
 <template>
@@ -64,7 +70,7 @@ function submit() {
       </button>
     </form>
 
-    <button class="link-btn" type="button" @click="isLoginMode = !isLoginMode">
+    <button class="link-btn" type="button" @click="toggleMode">
       {{ isLoginMode ? '没有账号？立即注册' : '已有账号？返回登录' }}
     </button>
   </section>

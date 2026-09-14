@@ -45,33 +45,39 @@ function onAdded() {
 <style scoped>
 .tool-tabs {
   display: flex;
-  gap: 0.5rem;
-  margin-bottom: 1.2rem;
-  border-bottom: 1px solid var(--border, #e2e2e2);
+  gap: var(--space-1);
+  margin-bottom: var(--space-5);
+  border-bottom: 1px solid var(--border-subtle);
 }
 .tool-tab {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
   background: none;
   border: none;
   border-bottom: 2px solid transparent;
   cursor: pointer;
-  font-size: 0.95rem;
-  padding: 0.5rem 0.9rem;
-  color: var(--muted, #666);
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 0.1rem;
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  padding: var(--space-2) var(--space-4);
+  color: var(--text-tertiary);
+  transition: color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+.tool-tab:hover {
+  color: var(--text-secondary);
 }
 .tool-tab em {
   font-style: normal;
-  font-size: 0.72rem;
-  color: var(--muted, #999);
+  font-size: var(--text-xs);
+  color: var(--text-disabled);
 }
 .tool-tab.active {
-  color: var(--accent, #4f6ef7);
-  border-bottom-color: var(--accent, #4f6ef7);
+  color: var(--primary-hover);
+  border-bottom-color: var(--primary);
 }
 .tool-tab.active em {
-  color: var(--accent, #4f6ef7);
+  color: var(--text-tertiary);
 }
 </style>

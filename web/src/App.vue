@@ -633,14 +633,46 @@ onUnmounted(() => {
                 :class="{ 'app-nav-item-active': activeView === item.key }"
                 @click="activeView = item.key"
               >
-                <span class="app-nav-dot"></span>
-                <span>{{ item.label }}</span>
+                <span class="app-nav-icon">
+                  <!-- 工作台：宫格布局 -->
+                  <svg v-if="item.key === 'workspace'" class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="3" y="3" width="7" height="7" rx="1.5" />
+                    <rect x="14" y="3" width="7" height="7" rx="1.5" />
+                    <rect x="3" y="14" width="7" height="7" rx="1.5" />
+                    <rect x="14" y="14" width="7" height="7" rx="1.5" />
+                  </svg>
+                  <!-- Agent：芯片 -->
+                  <svg v-else-if="item.key === 'agents'" class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="7" y="7" width="10" height="10" rx="2" />
+                    <path d="M9 3v2M15 3v2M9 19v2M15 19v2M3 9h2M3 15h2M19 9h2M19 15h2" />
+                  </svg>
+                  <!-- 工具：扳手 -->
+                  <svg v-else-if="item.key === 'tools'" class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+                  </svg>
+                  <!-- 知识库：翻开书本 -->
+                  <svg v-else-if="item.key === 'kb'" class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 7v14" />
+                    <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />
+                  </svg>
+                  <!-- 任务中心：清单 -->
+                  <svg v-else class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="m3 17 2 2 4-4" />
+                    <path d="m3 7 2 2 4-4" />
+                    <path d="M13 6h8M13 12h8M13 18h8" />
+                  </svg>
+                </span>
+                <span class="app-nav-label">{{ item.label }}</span>
               </button>
             </nav>
 
             <div class="app-sidebar-foot">
               <div class="service-status">
-                <span class="service-dot"></span>
+                <span class="service-dot">
+                  <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                    <circle cx="12" cy="12" r="5" fill="currentColor" stroke="none" />
+                  </svg>
+                </span>
                 <span>服务运行中</span>
               </div>
               <div class="app-user">
@@ -661,7 +693,20 @@ onUnmounted(() => {
               </div>
               <div class="app-topbar-actions">
                 <a class="app-topbar-link" :href="`${apiBaseUrl}/admin/tasks`" target="_blank" rel="noreferrer">Asynq 面板</a>
-                <button v-if="activeView === 'workspace'" type="button" class="primary-btn" @click="goCreateAgent">新建 Agent</button>
+                <button v-if="activeView === 'workspace'" type="button" class="primary-btn" @click="goCreateAgent">
+                  <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 5v14M5 12h14" />
+                  </svg>
+                  新建 Agent
+                </button>
+                <button type="button" class="topbar-logout" @click="handleLogout">
+                  <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                    <path d="m16 17 5-5-5-5" />
+                    <path d="M21 12H9" />
+                  </svg>
+                  退出
+                </button>
               </div>
             </header>
 
@@ -669,7 +714,12 @@ onUnmounted(() => {
               <!-- 工作台：内联对话 -->
               <section v-if="activeView === 'workspace'" class="conversation-workspace">
                 <aside class="conv-list-panel">
-                  <button type="button" class="primary-btn conv-new-btn" @click="goCreateAgent">新建 Agent</button>
+                  <button type="button" class="primary-btn conv-new-btn" @click="goCreateAgent">
+                    <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 5v14M5 12h14" />
+                    </svg>
+                    新建 Agent
+                  </button>
 
                   <div class="conv-list">
                     <div
@@ -684,7 +734,12 @@ onUnmounted(() => {
                       </button>
                       <div class="conv-item-side">
                         <span class="status-pill status-completed">{{ agent.status || 'active' }}</span>
-                        <button type="button" class="chat-modal-open-btn" @click="openChatModal(agent.id)">独立对话</button>
+                        <button type="button" class="chat-modal-open-btn" @click="openChatModal(agent.id)">
+                          <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
+                          </svg>
+                          独立对话
+                        </button>
                       </div>
                     </div>
 
@@ -705,10 +760,33 @@ onUnmounted(() => {
                       <p>{{ activeAgentSummary }}</p>
                     </div>
                     <div class="conv-chat-actions">
-                      <button v-if="selectedAgent" type="button" class="secondary-btn" @click="newConversation">新对话</button>
-                      <button v-if="selectedAgent && conversationByAgent[selectedAgent.id]" type="button" class="secondary-btn" @click="removeCurrentConversation">删除会话</button>
-                      <button v-if="selectedAgent" type="button" class="secondary-btn" @click="openChatModal(selectedAgent.id)">独立窗口</button>
-                      <button v-if="selectedAgent" type="button" class="secondary-btn" @click="goCreateAgent">管理 Agent</button>
+                      <button v-if="selectedAgent" type="button" class="secondary-btn" @click="newConversation">
+                        <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M12 5v14M5 12h14" />
+                        </svg>
+                        新对话
+                      </button>
+                      <button v-if="selectedAgent && conversationByAgent[selectedAgent.id]" type="button" class="secondary-btn" @click="removeCurrentConversation">
+                        <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6" />
+                        </svg>
+                        删除会话
+                      </button>
+                      <button v-if="selectedAgent" type="button" class="secondary-btn" @click="openChatModal(selectedAgent.id)">
+                        <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
+                        </svg>
+                        独立窗口
+                      </button>
+                      <button v-if="selectedAgent" type="button" class="secondary-btn" @click="goCreateAgent">
+                        <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M4 6h16M4 12h16M4 18h16" />
+                          <circle cx="9" cy="6" r="2" />
+                          <circle cx="15" cy="12" r="2" />
+                          <circle cx="7" cy="18" r="2" />
+                        </svg>
+                        管理 Agent
+                      </button>
                     </div>
                   </header>
 
@@ -755,7 +833,13 @@ onUnmounted(() => {
 
                     <div v-else class="chat-welcome">
                       <div class="chat-welcome-inner">
-                        <div class="badge">{{ selectedAgent ? 'Agent' : 'No Agent' }}</div>
+                        <div class="chat-welcome-illustration" aria-hidden="true">
+                          <svg class="icon" viewBox="0 0 24 24">
+                            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                            <path d="M8 9h8M8 13h5" />
+                          </svg>
+                        </div>
+                        <div class="badge">{{ selectedAgent ? 'Agent' : '未选择 Agent' }}</div>
                         <h2>{{ selectedAgent ? `与「${selectedAgent.name}」对话` : '选择一个 Agent 开始' }}</h2>
                         <p>{{ selectedAgent ? '发送消息后，任务会绑定到当前 Agent 并异步执行。' : '从左侧选择一个已搭建的智能体，或先创建一个。' }}</p>
                       </div>
@@ -775,6 +859,9 @@ onUnmounted(() => {
                           {{ selectedAgent ? `当前 Agent：${selectedAgent.name}` : '尚未选择 Agent' }}
                         </span>
                         <button class="primary-btn composer-send-btn" type="submit" :disabled="!canSendMessage || !selectedAgent">
+                          <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M12 19V5M5 12l7-7 7 7" />
+                          </svg>
                           {{ submitLoading ? '发送中...' : '发送' }}
                         </button>
                       </div>
@@ -850,7 +937,12 @@ onUnmounted(() => {
                       <div v-if="searchResult.error" class="query-result-text query-result-error">
                         {{ searchResult.error }}
                       </div>
-                      <button class="query-close-btn" type="button" @click="searchResult = null">关闭结果</button>
+                      <button class="query-close-btn" type="button" @click="searchResult = null">
+                        <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M18 6 6 18M6 6l12 12" />
+                        </svg>
+                        关闭结果
+                      </button>
                     </section>
                   </section>
 
@@ -887,7 +979,12 @@ onUnmounted(() => {
               </div>
               <div class="chat-modal-tools">
                 <span class="status-pill status-completed">{{ chatModalAgent?.status || 'active' }}</span>
-                <button type="button" class="chat-modal-close" @click="closeChatModal">关闭</button>
+                <button type="button" class="chat-modal-close" @click="closeChatModal">
+                  <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M18 6 6 18M6 6l12 12" />
+                  </svg>
+                  关闭
+                </button>
               </div>
             </header>
 
@@ -934,6 +1031,12 @@ onUnmounted(() => {
 
               <div v-else class="chat-welcome">
                 <div class="chat-welcome-inner">
+                  <div class="chat-welcome-illustration" aria-hidden="true">
+                    <svg class="icon" viewBox="0 0 24 24">
+                      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                      <path d="M8 9h8M8 13h5" />
+                    </svg>
+                  </div>
                   <div class="badge">Agent</div>
                   <h2>与「{{ chatModalAgent?.name }}」开始对话</h2>
                   <p>发送消息后，任务会绑定到当前 Agent 并异步执行。</p>
@@ -951,6 +1054,9 @@ onUnmounted(() => {
                 <div class="chat-composer-actions">
                   <span class="hint composer-hint">独立对话窗口</span>
                   <button class="primary-btn composer-send-btn" type="submit" :disabled="!canSendChatModalMessage">
+                    <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 19V5M5 12l7-7 7 7" />
+                    </svg>
                     {{ submitLoading ? '发送中...' : '发送' }}
                   </button>
                 </div>

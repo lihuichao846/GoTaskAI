@@ -94,11 +94,11 @@ func (h *KnowledgeBaseHandler) DeleteKnowledgeBase(c *gin.Context) {
 		return
 	}
 
-	if err := h.manager.DeleteKnowledgeBase(kb.ID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "知识库删除失败"})
+	if err := h.manager.RequestKnowledgeBaseDelete(kb.ID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "知识库删除任务提交失败"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "知识库已删除"})
+	c.JSON(http.StatusAccepted, gin.H{"message": "删除已提交，后台清理中"})
 }
 
 // AddDocumentRequest 定义上传文档的请求体（application/json 兼容方式）。
@@ -180,6 +180,33 @@ func (h *KnowledgeBaseHandler) AddDocument(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{"message": "文档已提交，异步构建中", "document_id": doc.ID})
+}
+
+// DeleteDocument 处理 DELETE /api/knowledge-bases/:id/documents/:docId，异步删除文档。
+// 删除走标记 + 后台三段式清理（Milvus / Neo4j / MySQL），失败可重试，不阻塞请求。
+func (h *KnowledgeBaseHandler) DeleteDocument(c *gin.Context) {
+	kb, ok := h.manager.GetKnowledgeBase(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "知识库不存在"})
+		return
+	}
+	if kb.UserID != c.GetUint("userID") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "无权操作此知识库"})
+		return
+	}
+
+	docID := c.Param("docId")
+	doc, ok := h.manager.GetDocument(docID)
+	if !ok || doc.KBID != kb.ID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "文档不存在"})
+		return
+	}
+
+	if err := h.manager.RequestDocumentDelete(docID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "文档删除任务提交失败"})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"message": "删除已提交，后台清理中"})
 }
 
 // readUploadedFile 读取上传文件并解码为 UTF-8 文本，仅允许文本类文件。

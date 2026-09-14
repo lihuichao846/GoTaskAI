@@ -665,8 +665,50 @@ func (m *TaskManager) IncrementKnowledgeBaseDocCount(kbID string) bool {
 	return true
 }
 
-// DeleteKnowledgeBase 删除知识库。
-func (m *TaskManager) DeleteKnowledgeBase(id string) error {
+// RequestKnowledgeBaseDelete 发起知识库删除：先把 KB 标记为 deleting（保证中断可恢复），
+// 再入队异步清理任务。真正的三层清理（Milvus / Neo4j / MySQL）由 Worker 的 kb:delete 完成，
+// 失败可被 Asynq 重试，不阻塞用户请求。
+func (m *TaskManager) RequestKnowledgeBaseDelete(id string) error {
+	res := m.db.Model(&model.KnowledgeBase{}).
+		Where("id = ?", id).
+		Updates(map[string]any{"status": "deleting", "updated_at": time.Now()})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return m.EnqueueKBDelete(id)
+}
+
+// EnqueueKBDelete 将知识库清理任务入队（低优先级队列）。
+func (m *TaskManager) EnqueueKBDelete(kbID string) error {
+	payload, err := json.Marshal(map[string]string{"kb_id": kbID})
+	if err != nil {
+		return err
+	}
+	task := asynq.NewTask("kb:delete", payload)
+	_, err = m.asynqClient.Enqueue(task, asynq.Queue("low"), asynq.MaxRetry(5))
+	return err
+}
+
+// ListDocumentIDsByKB 返回知识库下的全部文档 ID，供失效清理定位图谱来源。
+func (m *TaskManager) ListDocumentIDsByKB(kbID string) []string {
+	var ids []string
+	if err := m.db.Model(&model.Document{}).Where("kb_id = ?", kbID).Pluck("id", &ids).Error; err != nil {
+		slog.Error("list document ids failed", "kb_id", kbID, "error", err)
+		return nil
+	}
+	return ids
+}
+
+// DeleteDocumentsByKB 物理删除知识库下的全部文档行。
+func (m *TaskManager) DeleteDocumentsByKB(kbID string) error {
+	return m.db.Where("kb_id = ?", kbID).Delete(&model.Document{}).Error
+}
+
+// DeleteKnowledgeBaseRow 物理删除知识库行（三层清理完成后的最后一步）。
+func (m *TaskManager) DeleteKnowledgeBaseRow(id string) error {
 	return m.db.Where("id = ?", id).Delete(&model.KnowledgeBase{}).Error
 }
 
@@ -886,6 +928,19 @@ func (m *TaskManager) GetDocument(id string) (*model.Document, bool) {
 	return &d, true
 }
 
+// GetDocumentBySource 按 (kb_id, source_path) 查询文档，用于增量扫描的幂等判定。
+// 手动上传的文档 source_path 为空，不参与来源匹配。
+func (m *TaskManager) GetDocumentBySource(kbID, sourcePath string) (*model.Document, bool) {
+	if kbID == "" || sourcePath == "" {
+		return nil, false
+	}
+	var d model.Document
+	if err := m.db.Where("kb_id = ? AND source_path = ?", kbID, sourcePath).First(&d).Error; err != nil {
+		return nil, false
+	}
+	return &d, true
+}
+
 // GetDocumentSummaries 返回指定文档 ID 集合中已生成摘要的文档（docID -> summary）。
 // 供上下文渐进式披露注入摘要层。
 func (m *TaskManager) GetDocumentSummaries(docIDs []string) map[string]string {
@@ -908,6 +963,82 @@ func (m *TaskManager) GetDocumentSummaries(docIDs []string) map[string]string {
 // UpdateDocument 更新文档状态。
 func (m *TaskManager) UpdateDocument(d *model.Document) error {
 	return m.db.Save(d).Error
+}
+
+// RequestDocumentDelete 发起文档删除：先把文档置为 deleting（保证中断可恢复），再入队异步清理。
+// 三段式清理（Milvus / Neo4j / MySQL）由 Worker 的 doc:delete 任务完成，失败可重试，不阻塞请求。
+func (m *TaskManager) RequestDocumentDelete(docID string) error {
+	res := m.db.Model(&model.Document{}).
+		Where("id = ?", docID).
+		Update("status", "deleting")
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return m.EnqueueDocDelete(docID)
+}
+
+// EnqueueDocDelete 将文档清理任务入队（低优先级队列）。
+func (m *TaskManager) EnqueueDocDelete(docID string) error {
+	payload, err := json.Marshal(map[string]string{"doc_id": docID})
+	if err != nil {
+		return err
+	}
+	task := asynq.NewTask("doc:delete", payload)
+	_, err = m.asynqClient.Enqueue(task, asynq.Queue("low"), asynq.MaxRetry(5))
+	return err
+}
+
+// DeleteDocumentRow 物理删除文档行（三层清理完成后的最后一步）。
+func (m *TaskManager) DeleteDocumentRow(docID string) error {
+	return m.db.Where("id = ?", docID).Delete(&model.Document{}).Error
+}
+
+// DecrementKnowledgeBaseDocCount 原子递减知识库文档计数（下限为 0）。
+func (m *TaskManager) DecrementKnowledgeBaseDocCount(kbID string) {
+	if kbID == "" {
+		return
+	}
+	if err := m.db.Model(&model.KnowledgeBase{}).
+		Where("id = ? AND doc_count > 0", kbID).
+		UpdateColumn("doc_count", gorm.Expr("doc_count - 1")).Error; err != nil {
+		slog.Error("decrement doc_count failed", "kb_id", kbID, "error", err)
+	}
+}
+
+// ListStaleDeletingDocumentIDs 返回更新时间早于 cutoff 且仍处于 deleting 状态的文档 ID（限量）。
+// 供周期扫描做删除补偿：删除任务重试耗尽后，由扫描重新投递以保证最终一致。
+func (m *TaskManager) ListStaleDeletingDocumentIDs(cutoff time.Time, limit int) []string {
+	var ids []string
+	q := m.db.Model(&model.Document{}).
+		Where("status = ? AND updated_at < ?", "deleting", cutoff).
+		Order("updated_at asc")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if err := q.Pluck("id", &ids).Error; err != nil {
+		slog.Error("list stale deleting documents failed", "error", err)
+		return nil
+	}
+	return ids
+}
+
+// ListStaleDeletingKnowledgeBaseIDs 返回更新时间早于 cutoff 且仍处于 deleting 状态的知识库 ID（限量）。
+func (m *TaskManager) ListStaleDeletingKnowledgeBaseIDs(cutoff time.Time, limit int) []string {
+	var ids []string
+	q := m.db.Model(&model.KnowledgeBase{}).
+		Where("status = ? AND updated_at < ?", "deleting", cutoff).
+		Order("updated_at asc")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if err := q.Pluck("id", &ids).Error; err != nil {
+		slog.Error("list stale deleting knowledge bases failed", "error", err)
+		return nil
+	}
+	return ids
 }
 
 // EnqueueKBBuild 将知识库文档构建任务入队（低优先级队列）。

@@ -15,10 +15,12 @@
 # 临时文件
 temp/
 
-# 数据集与打包垃圾
-data/qangaroo_v1.1/
-data/__MACOSX/
+# 数据集与打包垃圾（data/ 下为评测数据集，总量 >1.3GB，不入库；已跟踪的示例 md 不受影响）
+data/
 
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 文档目录（不随远程仓库上传）
+docs/

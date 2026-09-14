@@ -93,6 +93,10 @@ func main() {
 		defer neo4jDriver.Close(context.Background())
 		kagManager = kag.NewKAGManager(neo4jDriver, llm.NewClient())
 		slog.Info("Connected to Neo4j successfully, KAG ingestion enabled")
+		// 为关系建立 source_doc 属性索引，使按来源文档的失效清理不必全图扫描（幂等，失败不致命）。
+		if err := kagManager.EnsureSourceDocIndex(context.Background()); err != nil {
+			slog.Warn("Failed to ensure graph source_doc index", "error", err)
+		}
 	}
 
 	// 3. 初始化 HTTP 路由与控制器 (API Handlers)
@@ -201,6 +205,7 @@ func main() {
 			knowledgeGroup.GET("/:id", knowledgeBaseHandler.GetKnowledgeBase)
 			knowledgeGroup.DELETE("/:id", knowledgeBaseHandler.DeleteKnowledgeBase)
 			knowledgeGroup.POST("/:id/documents", knowledgeBaseHandler.AddDocument)
+			knowledgeGroup.DELETE("/:id/documents/:docId", knowledgeBaseHandler.DeleteDocument)
 		}
 
 		apiGroup.GET("/tasks/stream", handler.StreamTasks)

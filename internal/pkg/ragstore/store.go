@@ -312,6 +312,35 @@ func (s *Store) GetChunksByDocID(ctx context.Context, docID string) ([]schema.Do
 	})
 	return docs, nil
 }
+
+// DeleteByDocID 按 doc_id 删除该文档在向量库中的全部 chunk。
+func (s *Store) DeleteByDocID(ctx context.Context, docID string) error {
+	if docID == "" {
+		return nil
+	}
+	return s.deleteByExpr(ctx, fmt.Sprintf(`%s == "%s"`, fieldDocID, escapeExpr(docID)))
+}
+
+// DeleteByKBID 按 kb_id 批量删除该知识库的全部 chunk。
+func (s *Store) DeleteByKBID(ctx context.Context, kbID string) error {
+	if kbID == "" {
+		return nil
+	}
+	return s.deleteByExpr(ctx, fmt.Sprintf(`%s == "%s"`, fieldKBID, escapeExpr(kbID)))
+}
+
+// deleteByExpr 执行带表达式过滤的删除并强制 Flush，保证删除对后续检索可见。
+// Milvus 删除是异步的：不 Flush 时被删 chunk 仍可能被检索命中（幽灵召回，D1）。
+func (s *Store) deleteByExpr(ctx context.Context, expr string) error {
+	if err := s.client.Delete(ctx, s.coll, "", expr); err != nil {
+		return fmt.Errorf("ragstore: delete by expr %q: %w", expr, err)
+	}
+	if err := s.client.Flush(ctx, s.coll, false); err != nil {
+		return fmt.Errorf("ragstore: flush after delete: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) tokenize(text string) []string {
 	raw := s.seg.Cut(text, true)
 	out := make([]string, 0, len(raw))

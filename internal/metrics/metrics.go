@@ -70,4 +70,24 @@ var (
 		Name: "gotaskai_context_compress_failed_total",
 		Help: "上下文压缩失败次数",
 	})
+
+	// IntentDecisions 记录意图路由决策次数，按决策来源（rule/semantic/llm/fallback 等）分桶。
+	// 各层命中率可直接由 source 分布计算。
+	IntentDecisions = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gotaskai_intent_decisions_total",
+		Help: "意图路由决策次数（按决策来源）",
+	}, []string{"source"})
+
+	// IntentRouteLatency 记录路由阶段（语义+LLM）的耗时（秒）。
+	IntentRouteLatency = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gotaskai_intent_route_latency_seconds",
+		Help:    "意图路由阶段耗时（秒）",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
+	})
+
+	// IntentRetrievalSkipped 记录跳过 RAG 检索的次数（NeedRAG=false），用于量化成本节省。
+	IntentRetrievalSkipped = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gotaskai_intent_retrieval_skipped_total",
+		Help: "因意图路由跳过 RAG 检索的次数",
+	})
 )

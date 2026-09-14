@@ -174,91 +174,145 @@ function onSaved() {
 <style scoped>
 .source-tabs {
   display: flex;
-  gap: 0.5rem;
-  margin-bottom: 1rem;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
 }
 .source-tab {
-  border: 1px solid var(--border, #e2e2e2);
-  background: #fff;
-  padding: 0.4rem 0.9rem;
-  border-radius: 999px;
+  border: 1px solid var(--border-default);
+  background: var(--surface-2);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-full);
   cursor: pointer;
-  font-size: 0.85rem;
-  color: var(--muted, #666);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text-secondary);
+  transition: color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    background-color var(--dur-fast) var(--ease-out);
+}
+.source-tab:hover {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
 }
 .source-tab.active {
-  background: var(--accent, #4f6ef7);
-  border-color: var(--accent, #4f6ef7);
-  color: #fff;
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--primary-contrast);
 }
 .source-pane {
   display: flex;
   flex-direction: column;
-  gap: 0.8rem;
+  gap: var(--space-3);
 }
 .source-help {
-  color: var(--muted, #8c8c8c);
-  font-size: 0.8rem;
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
   margin: 0;
 }
 .discover-form {
   display: flex;
-  gap: 0.5rem;
+  gap: var(--space-2);
 }
 .discover-form input {
   flex: 1;
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  font: inherit;
+  font-size: var(--text-base);
+  background: var(--bg-2);
+  color: var(--text-primary);
+  outline: none;
+  transition: border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+.discover-form input::placeholder {
+  color: var(--text-disabled);
+}
+.discover-form input:focus {
+  border-color: var(--primary);
+  box-shadow: var(--shadow-focus);
 }
 .source-intent {
-  font-size: 0.82rem;
-  color: var(--muted, #8c8c8c);
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
 }
 .discover-results {
   display: flex;
   flex-direction: column;
-  gap: 0.6rem;
+  gap: var(--space-3);
 }
 .discover-item {
-  background: var(--bg-soft, #f6f7f9);
-  border: 1px solid var(--border, #e2e2e2);
-  border-radius: 8px;
-  padding: 0.6rem 0.7rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+.discover-item:hover {
+  border-color: var(--border-default);
 }
 .discover-item-head {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  width: 100%;
+}
+.discover-item-head strong {
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  color: var(--text-primary);
 }
 .badge {
-  font-size: 0.72rem;
-  padding: 0.05rem 0.4rem;
-  border-radius: 999px;
-  background: var(--accent, #4f6ef7);
-  color: #fff;
+  font-size: var(--text-xs);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--primary-soft);
+  color: var(--primary-hover);
+  border: 1px solid var(--border-default);
 }
 .stars {
-  font-size: 0.75rem;
-  color: var(--muted, #8c8c8c);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
 }
 .discover-item-desc {
-  font-size: 0.82rem;
-  color: var(--muted, #6b6b6b);
-  margin: 0.35rem 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin: 0;
+  line-height: var(--leading-normal);
 }
 .install-cmd {
-  font-size: 0.78rem;
+  font-size: var(--text-xs);
   display: block;
-  background: #eef0f3;
-  border-radius: 6px;
-  padding: 0.25rem 0.4rem;
+  width: 100%;
+  background: var(--bg-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
   overflow-x: auto;
+  color: var(--text-secondary);
 }
 .repo-link {
-  font-size: 0.78rem;
-  margin-right: 0.6rem;
+  font-size: var(--text-sm);
+  color: var(--primary-hover);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+.repo-link:hover {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 .checkbox-row {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: var(--space-2);
+  flex-direction: row;
 }
 </style>

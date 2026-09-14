@@ -20,7 +20,9 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 
+	"github.com/hibiken/asynq"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -51,6 +53,11 @@ func runSupervisor(cfg config.Config) {
 	}
 
 	slog.Info("Launching worker processes", "processes", processes, "workers_per_process", cfg.Queue.Workers)
+
+	// W2：kb:scan 周期任务只在 worker 主实例（supervisor）注册，避免每个子进程各注册一份导致重复投递（R4）。
+	if scheduler := startKBScanScheduler(cfg); scheduler != nil {
+		defer scheduler.Shutdown()
+	}
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -94,6 +101,56 @@ func runSupervisor(cfg config.Config) {
 	slog.Info("Worker supervisor exiting")
 }
 
+// startKBScanScheduler 在 worker 主实例注册 kb:scan 周期任务（W2 定时增量入库）。
+// 单实例投递：只在 supervisor 注册一次，子进程不注册，避免重复调度（R4）。
+// 返回 nil 表示未启用或 cron 非法（不致命，仅告警）。
+// 说明：扫描源不可读时仍会启动调度器——因为删除补偿（W3 6.4）复用本任务，
+// 此时只做补偿、不扫源，避免删除任务重试耗尽后无人接管。
+func startKBScanScheduler(cfg config.Config) *asynq.Scheduler {
+	if !cfg.KB.ScanEnabled {
+		return nil
+	}
+	if cfg.KB.ScanCron == "" {
+		slog.Warn("kb:scan scheduler disabled: scan_cron is empty")
+		return nil
+	}
+
+	if len(cfg.KB.ScanSources) == 0 {
+		slog.Warn("kb:scan: no scan_sources configured, only delete compensation will run")
+	} else {
+		// 启动时校验源目录可读性：容器/多节点部署下本地路径可能不可见（R8）。
+		readable := 0
+		for _, src := range cfg.KB.ScanSources {
+			if src.KBID == "" || src.Path == "" {
+				slog.Warn("kb:scan source ignored: kb_id and path are required")
+				continue
+			}
+			info, err := os.Stat(src.Path)
+			if err != nil || !info.IsDir() {
+				slog.Warn("kb:scan source unreadable, will be skipped at runtime", "path", src.Path, "error", err)
+				continue
+			}
+			readable++
+		}
+		if readable == 0 {
+			slog.Warn("kb:scan: no readable scan source, only delete compensation will run")
+		}
+	}
+
+	scheduler := asynq.NewScheduler(db.NewAsynqRedisConnOpt(cfg.Redis), &asynq.SchedulerOpts{Location: time.Local})
+	task := asynq.NewTask("kb:scan", []byte("{}"), asynq.Queue("low"))
+	if _, err := scheduler.Register(cfg.KB.ScanCron, task); err != nil {
+		slog.Error("kb:scan scheduler registration failed", "cron", cfg.KB.ScanCron, "error", err)
+		return nil
+	}
+	if err := scheduler.Start(); err != nil {
+		slog.Error("kb:scan scheduler start failed", "error", err)
+		return nil
+	}
+	slog.Info("kb:scan scheduler started", "cron", cfg.KB.ScanCron, "sources", len(cfg.KB.ScanSources))
+	return scheduler
+}
+
 func runWorkerProcess(cfg config.Config) {
 	childIndex, err := strconv.Atoi(os.Getenv(workerChildIndexEnv))
 	if err != nil {
@@ -133,6 +190,10 @@ func runWorkerProcess(cfg config.Config) {
 		defer neo4jDriver.Close(context.Background())
 		kagManager = kag.NewKAGManager(neo4jDriver, llm.NewClient())
 		slog.Info("Connected to Neo4j successfully, KAG retrieval enabled")
+		// 为关系建立 source_doc 属性索引，使按来源文档的失效清理不必全图扫描（幂等，失败不致命）。
+		if err := kagManager.EnsureSourceDocIndex(context.Background()); err != nil {
+			slog.Warn("Failed to ensure graph source_doc index", "error", err)
+		}
 	}
 
 	// 初始化 MCP 客户端 (赋予 Worker 大模型工具调用能力)

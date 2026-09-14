@@ -7,7 +7,12 @@ import (
 	"testing"
 
 	"gotaskai/internal/config"
+	"gotaskai/internal/model"
+	"gotaskai/internal/pkg/intent"
+	"gotaskai/internal/pkg/llm"
+	"gotaskai/internal/pkg/toolregistry"
 
+	"github.com/sashabaranov/go-openai"
 	"github.com/tmc/langchaingo/schema"
 )
 
@@ -239,5 +244,88 @@ func BenchmarkChunkByScore(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = chunkByScore(d, cc)
+	}
+}
+
+// ---- 意图路由接线：验证 Worker 侧的能力组装、凭证透传与保守兜底 ----
+
+// stubIntentRouter 记录调用参数并返回预置决策，用于在无外部依赖下测试路由接线。
+type stubIntentRouter struct {
+	decision intent.Decision
+	calls    int
+	lastReq  intent.Request
+}
+
+func (s *stubIntentRouter) Route(_ context.Context, req intent.Request, _ *llm.Budget) intent.Decision {
+	s.calls++
+	s.lastReq = req
+	return s.decision
+}
+
+// fakeNamedTool 仅用于构造按名称判定的工具集合。
+type fakeNamedTool struct{ name string }
+
+func (f fakeNamedTool) Name() string                                            { return f.name }
+func (f fakeNamedTool) Description() string                                     { return "" }
+func (f fakeNamedTool) ToOpenAITool() openai.Tool                               { return openai.Tool{} }
+func (f fakeNamedTool) Execute(context.Context, map[string]any) (string, error) { return "", nil }
+
+func newTestPool(r intent.Router) *Pool {
+	// inFlight 必须初始化：routeIntent 会登记/注销路由阶段的取消函数。
+	return &Pool{intentRouter: r, inFlight: make(map[string]context.CancelFunc)}
+}
+
+func TestRouteIntent_NilRouterIsConservative(t *testing.T) {
+	p := newTestPool(nil)
+	d := p.routeIntent(context.Background(), model.Task{ID: "t1", Payload: "我们的部署文档在哪"}, nil, nil, "", "", "")
+	if d.Source != intent.SourceDisabled {
+		t.Fatalf("expected %q when router not configured, got %q", intent.SourceDisabled, d.Source)
+	}
+	if !d.NeedTools {
+		t.Fatal("conservative default should keep tools available")
+	}
+}
+
+func TestRouteIntent_ChatSkipsRetrieval(t *testing.T) {
+	r := &stubIntentRouter{decision: intent.Decision{Intent: intent.IntentChat, Source: intent.SourceRule, Confidence: 0.95}}
+	p := newTestPool(r)
+
+	d := p.routeIntent(context.Background(), model.Task{ID: "t2", Payload: "你好"}, nil, nil, "", "", "")
+	if r.calls != 1 {
+		t.Fatalf("expected router called once, got %d", r.calls)
+	}
+	if d.NeedRAG || d.NeedKAG || d.Intent != intent.IntentChat {
+		t.Fatalf("chat decision must skip retrieval, got %+v", d)
+	}
+}
+
+func TestRouteIntent_PassesCapabilityAndCredentials(t *testing.T) {
+	r := &stubIntentRouter{}
+	p := newTestPool(r)
+
+	// ragStore/kagManager 均为 nil：能力标记应为 false（用于上层短路判断）。
+	p.routeIntent(context.Background(), model.Task{ID: "t3", Payload: "问题"}, nil, nil, "k", "u", "m")
+
+	if r.lastReq.HasKB || r.lastReq.HasKAG {
+		t.Fatalf("expected HasKB/HasKAG false without rag/kag, got %+v", r.lastReq)
+	}
+	if r.lastReq.APIKey != "k" || r.lastReq.BaseURL != "u" || r.lastReq.Model != "m" {
+		t.Fatalf("expected agent credentials forwarded, got %+v", r.lastReq)
+	}
+}
+
+func TestRouteIntent_PassesInternetFlag(t *testing.T) {
+	r := &stubIntentRouter{}
+	p := newTestPool(r)
+
+	tools := []toolregistry.Tool{fakeNamedTool{name: "internet_search"}}
+	p.routeIntent(context.Background(), model.Task{ID: "t4", Payload: "查一下最新新闻"}, tools, nil, "", "", "")
+	if !r.lastReq.HasInternet {
+		t.Fatalf("expected HasInternet=true when internet_search bound, got %+v", r.lastReq)
+	}
+
+	p.routeIntent(context.Background(), model.Task{ID: "t5", Payload: "查一下最新新闻"}, []toolregistry.Tool{fakeNamedTool{name: "other"}}, nil, "", "", "")
+	if r.lastReq.HasInternet {
+		t.Fatalf("expected HasInternet=false for other tools, got %+v", r.lastReq)
 	}
 }

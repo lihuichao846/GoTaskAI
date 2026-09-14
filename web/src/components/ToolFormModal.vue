@@ -106,7 +106,11 @@ async function submit() {
     <div class="modal-dialog">
       <div class="modal-head">
         <h3>{{ mode === 'edit' ? '编辑工具' : '注册 MCP 工具' }}</h3>
-        <button class="modal-close" @click="handleClose">✕</button>
+        <button class="modal-close" @click="handleClose" aria-label="关闭">
+          <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M18 6 6 18M6 6l12 12" />
+          </svg>
+        </button>
       </div>
 
       <div class="auth-form">
@@ -151,59 +155,80 @@ async function submit() {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.4);
+  background: rgba(6, 8, 13, 0.72);
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding: 8vh 1rem 1rem;
+  padding: 8vh var(--space-4) var(--space-4);
   z-index: 1000;
 }
 .modal-dialog {
-  background: #fff;
-  border-radius: 12px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-xl);
   width: 100%;
-  max-width: 520px;
-  padding: 1.2rem;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2);
+  max-width: 540px;
+  padding: var(--space-6);
+  box-shadow: var(--shadow-lg);
 }
 .modal-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 1rem;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
 }
 .modal-head h3 {
   margin: 0;
+  font-size: var(--text-lg);
 }
 .modal-close {
-  border: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
   background: transparent;
-  font-size: 1rem;
   cursor: pointer;
-  color: var(--muted, #8c8c8c);
-  padding: 0.2rem 0.4rem;
-  margin: 0;
+  color: var(--text-tertiary);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
+  transition: color var(--dur-fast) var(--ease-out),
+    background-color var(--dur-fast) var(--ease-out);
+}
+.modal-close:hover {
+  color: var(--text-primary);
+  background: var(--surface-2);
 }
 .tool-actions {
   display: flex;
-  gap: 0.6rem;
+  gap: var(--space-3);
   align-items: center;
+  flex-wrap: wrap;
 }
 .test-result {
-  margin-top: 0.6rem;
-  font-size: 0.82rem;
-  padding: 0.5rem 0.6rem;
-  border-radius: 6px;
+  margin-top: var(--space-3);
+  font-size: var(--text-sm);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
   word-break: break-all;
+  border: 1px solid var(--border-default);
 }
 .test-ok {
-  background: #e9f7ef;
-  color: #1d7a3a;
-  border: 1px solid #bfe3cc;
+  background: var(--success-soft);
+  color: var(--success-text);
 }
 .test-fail {
-  background: #fdecec;
-  color: #b3261e;
-  border: 1px solid #f3c3c3;
+  background: var(--danger-soft);
+  color: var(--danger-text);
+}
+@media (max-width: 639px) {
+  .modal-overlay {
+    padding: var(--space-3);
+    align-items: stretch;
+  }
+  .modal-dialog {
+    max-width: none;
+    margin-top: var(--space-6);
+  }
 }
 </style>

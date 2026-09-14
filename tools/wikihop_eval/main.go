@@ -145,7 +145,7 @@ func main() {
 	// ---------- 数据入库：向量化 supports 文档 ----------
 	splitter := textSplitter()
 	docCount := 0
-	for _, s := range samples {
+	for i, s := range samples {
 		for _, sup := range s.Supports {
 			doc := schema.Document{PageContent: sup, Metadata: map[string]any{"source": s.ID, "kb_id": "default", "doc_id": s.ID}}
 			chunks, err := textsplitter.SplitDocuments(splitter, []schema.Document{doc})
@@ -159,14 +159,16 @@ func main() {
 			}
 			docCount++
 		}
+		log.Printf("vectorized sample %d/%d (%s), total=%d", i+1, len(samples), s.ID, docCount)
 	}
 	log.Printf("vectorized %d supports docs across %d samples", docCount, len(samples))
 
 	// ---------- 全链路建图：LLM 抽取三元组 -> IngestGraph ----------
 	tripleTotal := 0
 	failedExtract := 0
-	for _, s := range samples {
+	for i, s := range samples {
 		text := strings.Join(s.Supports, "\n---\n")
+		log.Printf("extracting sample %d/%d (%s)...", i+1, len(samples), s.ID)
 		rels, err := kagMgr.ExtractKnowledge(ctx, text)
 		if err != nil {
 			log.Printf("extract fail [%s]: %v", s.ID, err)
@@ -177,6 +179,7 @@ func main() {
 			log.Printf("ingest fail [%s]: %v", s.ID, err)
 		}
 		tripleTotal += len(rels)
+		log.Printf("extracted %d triples for %s (total=%d)", len(rels), s.ID, tripleTotal)
 	}
 	log.Printf("ingested %d triples (extract failures across %d samples)", tripleTotal, failedExtract)
 

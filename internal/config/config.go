@@ -17,19 +17,21 @@ type Config struct {
 	EventBus EventBusConfig `mapstructure:"eventbus"`
 	Neo4j    Neo4jConfig    `mapstructure:"neo4j"`
 	Queue    QueueConfig    `mapstructure:"queue"`
+	KB       KBConfig       `mapstructure:"kb"`
 	LLM      LLMConfig      `mapstructure:"llm"`
 	Rerank   RerankConfig   `mapstructure:"rerank"`
 	Compress CompressConfig `mapstructure:"compress"`
 	Context  ContextConfig  `mapstructure:"context"`
+	Intent   IntentConfig   `mapstructure:"intent"`
 	Metrics  MetricsConfig  `mapstructure:"metrics"`
 	Milvus   MilvusConfig   `mapstructure:"milvus"`
 }
 
 // EventBusConfig 配置 Worker 与 API 之间实时事件的独立消息通道（NATS）。
 type EventBusConfig struct {
-	Enabled   bool   `mapstructure:"enabled"`
-	URL       string `mapstructure:"url"`       // NATS 地址，如 nats://0.0.0.0:4222
-	Embedded  bool   `mapstructure:"embedded"`  // 是否在本进程内嵌启动 nats-server（仅 API 进程设置为 true）
+	Enabled  bool   `mapstructure:"enabled"`
+	URL      string `mapstructure:"url"`      // NATS 地址，如 nats://0.0.0.0:4222
+	Embedded bool   `mapstructure:"embedded"` // 是否在本进程内嵌启动 nats-server（仅 API 进程设置为 true）
 }
 
 type ServerConfig struct {
@@ -73,6 +75,30 @@ type QueueConfig struct {
 	Capacity  int `mapstructure:"capacity"`
 	Workers   int `mapstructure:"workers"`
 	Processes int `mapstructure:"processes"`
+}
+
+// KBConfig 为知识库建库链路的开关与限流配置（W1 图谱抽取入队 / W2 定时增量入库）。
+type KBConfig struct {
+	// GraphEnabled 控制建库任务是否执行图谱抽取阶段；默认 false，灰度开启。
+	GraphEnabled bool `mapstructure:"graph_enabled"`
+	// GraphQueueConcurrency 为图谱阶段并发上限（与向量阶段共用 low 队列，靠信号量限流）；<=0 表示不限制。
+	GraphQueueConcurrency int `mapstructure:"graph_queue_concurrency"`
+
+	// ScanEnabled 控制是否注册周期扫描任务 kb:scan（默认 false，先在单实例灰度）。
+	ScanEnabled bool `mapstructure:"scan_enabled"`
+	// ScanCron 为扫描周期（标准 5 段 cron，如 "0 3 * * *" 表示每日 03:00）；为空时不注册。
+	ScanCron string `mapstructure:"scan_cron"`
+	// ScanBatchSize 为单次扫描窗口最多入队的文档数，防雪崩；<=0 表示不限制。
+	ScanBatchSize int `mapstructure:"scan_batch_size"`
+	// ScanSources 为增量扫描的源目录列表，每个源绑定一个知识库。
+	ScanSources []KBSourceConfig `mapstructure:"scan_sources"`
+}
+
+// KBSourceConfig 描述一个增量扫描源：把 Path 目录下的文件同步进 KBID 知识库。
+// 源文件与文档以 (kb_id, source_path) 为唯一键，内容 sha256 作为变更判据。
+type KBSourceConfig struct {
+	KBID string `mapstructure:"kb_id"`
+	Path string `mapstructure:"path"`
 }
 
 type LLMConfig struct {
@@ -139,6 +165,28 @@ type ContextConfig struct {
 	// EnableParentContext 控制是否启用上一级文档上下文兜底（B1 扩展失败/存量缺 chunk_index 时，
 	// 回退为 Document.Content 全文）。默认 true。
 	EnableParentContext bool `mapstructure:"enable_parent_context"`
+}
+
+// IntentConfig 控制 Agent 检索/工具路由（成本优化）：在检索之前判断本次任务
+// 是否需要执行 RAG（Milvus）与 KAG（Neo4j）检索，跳过不必要的检索与 LLM 调用。
+// 采用「规则兜底 + 语义快路径 + LLM 结构化分类」三级混合，任一环节不确定即保守回退全量检索。
+type IntentConfig struct {
+	// Enabled 为总开关；false 时行为与改造前完全一致（不产生任何新增调用）。
+	Enabled bool `mapstructure:"enabled"`
+	// Mode 为路由模式：rule（仅寒暄短路）| semantic（+语义层）| hybrid（+LLM 兜底）；默认 rule。
+	Mode string `mapstructure:"mode"`
+	// SemanticHigh 为语义层采信阈值（相似度低于该值则下传下一层）。
+	SemanticHigh float64 `mapstructure:"semantic_high"`
+	// SemanticMargin 为语义层 top1 与「异类 top2」的最小间隔，用于排除类别歧义。
+	SemanticMargin float64 `mapstructure:"semantic_margin"`
+	// SemanticAllowClose 是否允许语义层「关闭检索」（默认 false，需评测漏检率 ≤2% 才可开启）。
+	SemanticAllowClose bool `mapstructure:"semantic_allow_close"`
+	// LLMMinConfidence 为 LLM 分类结果的采信阈值，低于该值走安全阀回退。
+	LLMMinConfidence float64 `mapstructure:"llm_min_confidence"`
+	// RouteTimeoutSeconds 为路由阶段（语义+LLM）的总超时（秒），<=0 时回退默认 5 秒。
+	RouteTimeoutSeconds int `mapstructure:"route_timeout_seconds"`
+	// EnableToolRouting 开启时 LLM 使用四分类提示词并据此裁剪工具（默认 false，暂不裁剪）。
+	EnableToolRouting bool `mapstructure:"enable_tool_routing"`
 }
 
 var AppConfig Config

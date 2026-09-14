@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "M7 任务调度中心 · 任务状态机与重试回路",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1030, 630],
+    "views": [
+      { "id": "main-path", "label": "主链路五阶段", "focus": ["pending", "routing", "executing", "writing", "completed"], "note": "从落库投递到结果落地，写回阶段是一个真实的决策闸门。" },
+      { "id": "retry-loop", "label": "受控重试回路", "focus": ["pending", "executing"], "note": "失败且预算未耗尽时直接回到待处理，没有中间态；每次重试都回读数据库校正计数。" },
+      { "id": "terminals", "label": "两个终态出口", "focus": ["executing", "writing", "failed", "cancelled"], "note": "失败来自执行阶段，取消由写回阶段的并发校验产生。" }
+    ]
+  },
+  "lanes": [
+    { "id": "main", "label": "主链路（顺序阶段）" },
+    { "id": "terminal", "label": "终态出口" }
+  ],
+  "states": [
+    { "id": "pending", "type": "start", "label": "待处理", "sublabel": "已落库并投递", "lane": "main", "col": 0, "step": "01", "tag": "入口" },
+    { "id": "routing", "type": "active", "label": "意图路由", "sublabel": "判定是否检索", "lane": "main", "col": 1, "step": "02", "tag": "成本闸门" },
+    { "id": "executing", "type": "active", "label": "执行中", "sublabel": "检索与生成", "lane": "main", "col": 2, "step": "03", "tag": "模型调用" },
+    { "id": "writing", "type": "decision", "label": "写回校验", "sublabel": "条件更新校验", "lane": "main", "col": 3, "step": "04", "tag": "并发闸门" },
+    { "id": "completed", "type": "success", "label": "已完成", "sublabel": "结果落库广播", "lane": "main", "col": 4, "step": "05", "tag": "成功" },
+    { "id": "failed", "type": "failure", "label": "失败", "sublabel": "重试耗尽", "lane": "terminal", "col": 0, "tag": "不可重试" },
+    { "id": "cancelled", "type": "failure", "label": "已取消", "sublabel": "用户取消", "lane": "terminal", "col": 1, "tag": "取消胜出" }
+  ],
+  "transitions": [
+    { "id": "retry-loop", "from": "executing", "to": "pending", "variant": "emphasis", "fromSide": "top", "toSide": "top", "via": [[402, 80], [94, 80]] },
+    { "id": "retry-exhausted", "from": "executing", "to": "failed", "variant": "security", "route": "straight", "fromSide": "bottom", "toSide": "top", "label": "重试耗尽或预算超限", "labelAt": [402, 319] },
+    { "id": "cancel-wins", "from": "writing", "to": "cancelled", "variant": "security", "route": "straight", "fromSide": "bottom", "toSide": "top", "label": "写回被拒，取消胜出", "labelAt": [556, 319] }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "五阶段 ≠ 五个落库状态", "items": ["只有待处理、完成、失败、取消是真实状态", "路由、执行、写回在库里都写作 processing"] },
+    { "dot": "orange", "title": "重试是受控回路", "items": ["预算未耗尽时直接回到待处理，不经过失败态", "跨重试累计上限（默认 30）用尽即永久失败"] },
+    { "dot": "rose", "title": "终态不可覆盖", "items": ["写回带条件：影响 0 行即丢弃本次结果", "人工复活只能从失败态手动重试"] }
+  ]
+}

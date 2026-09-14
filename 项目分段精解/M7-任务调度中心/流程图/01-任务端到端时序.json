@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "M7 任务调度中心 · 任务端到端时序",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "column_fit": "spread",
+    "viewBox": [1080, 560],
+    "views": [
+      { "id": "accept", "label": "① 受理：提交即返回", "focus": ["browser", "api", "mysql", "redis"], "note": "只做落库、入队、应答三个毫秒级动作，耗时执行被甩给另一个进程。" },
+      { "id": "execute", "label": "② 执行：独立进程消费", "focus": ["redis", "worker", "llm", "mysql"], "note": "Worker 独立消费，写回时用条件更新保护终态。" },
+      { "id": "notify", "label": "③④ 回传与取消", "focus": ["worker", "nats", "api", "browser"], "note": "状态经事件总线跨进程回传再转 SSE；取消走反向广播中断在途调用。" }
+    ]
+  },
+  "participants": [
+    { "id": "browser", "type": "external", "label": "浏览器", "sublabel": "Vue3 前端" },
+    { "id": "api", "type": "backend", "label": "API 进程", "sublabel": "接客与投递" },
+    { "id": "mysql", "type": "database", "label": "MySQL", "sublabel": "状态真相" },
+    { "id": "redis", "type": "messagebus", "label": "Redis 与 Asynq", "sublabel": "队列与缓存" },
+    { "id": "worker", "type": "backend", "label": "Worker 进程", "sublabel": "消费与执行" },
+    { "id": "llm", "type": "cloud", "label": "大模型", "sublabel": "兼容接口" },
+    { "id": "nats", "type": "messagebus", "label": "NATS 总线", "sublabel": "跨进程事件" }
+  ],
+  "segments": [
+    { "from": 150, "to": 258, "label": "① 受理" },
+    { "from": 266, "to": 362, "label": "② 执行" },
+    { "from": 372, "to": 418, "label": "③ 回传" },
+    { "from": 428, "to": 478, "label": "④ 取消" }
+  ],
+  "messages": [
+    { "id": "m1", "from": "browser", "to": "api", "y": 160, "label": "POST /api/tasks/submit", "variant": "emphasis" },
+    { "id": "m2", "from": "api", "to": "mysql", "y": 188, "label": "INSERT 任务·pending", "variant": "emphasis" },
+    { "id": "m3", "from": "api", "to": "redis", "y": 216, "label": "缓存并入队", "variant": "emphasis" },
+    { "id": "m4", "from": "api", "to": "browser", "y": 244, "label": "202 + 任务 ID", "variant": "return" },
+    { "id": "m5", "from": "redis", "to": "worker", "y": 272, "label": "投递 task:process", "variant": "emphasis" },
+    { "id": "m6", "from": "worker", "to": "llm", "y": 300, "label": "调用模型", "variant": "default" },
+    { "id": "m7", "from": "llm", "to": "worker", "y": 328, "label": "结果 / 超时", "variant": "return" },
+    { "id": "m8", "from": "worker", "to": "mysql", "y": 356, "label": "条件写回终态", "variant": "emphasis" },
+    { "id": "m9", "from": "worker", "to": "nats", "y": 384, "label": "发布任务更新事件", "variant": "dashed" },
+    { "id": "m10", "from": "api", "to": "browser", "y": 412, "label": "NATS 转发 → SSE", "variant": "dashed" },
+    { "id": "m11", "from": "browser", "to": "api", "y": 440, "label": "POST /api/tasks/:id/cancel", "variant": "security" },
+    { "id": "m12", "from": "api", "to": "nats", "y": 468, "label": "广播取消指令", "variant": "dashed" }
+  ],
+  "activations": [
+    { "participant": "api", "from": 152, "to": 250, "type": "backend" },
+    { "participant": "mysql", "from": 182, "to": 256, "type": "database" },
+    { "participant": "redis", "from": 210, "to": 278, "type": "messagebus" },
+    { "participant": "worker", "from": 264, "to": 370, "type": "backend" },
+    { "participant": "llm", "from": 294, "to": 334, "type": "cloud" },
+    { "participant": "mysql", "from": 350, "to": 370, "type": "database" },
+    { "participant": "nats", "from": 378, "to": 418, "type": "messagebus" },
+    { "participant": "api", "from": 406, "to": 418, "type": "backend" },
+    { "participant": "api", "from": 434, "to": 484, "type": "backend" },
+    { "participant": "nats", "from": 462, "to": 478, "type": "messagebus" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "受理即返回", "items": ["提交只做落库、入队、应答三个毫秒级动作", "HTTP 202 立刻返回，不等模型耗时"] },
+    { "dot": "orange", "title": "终态保护", "items": ["写回带条件：已是终态则影响 0 行并丢弃结果", "用户取消优先于“我已经算完了”"] },
+    { "dot": "emerald", "title": "正确性与实时性解耦", "items": ["真相在 MySQL，事件总线只负责“快”", "总线故障只丢实时推送，前端用轮询兜底"] }
+  ]
+}

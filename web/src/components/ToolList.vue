@@ -126,6 +126,10 @@ onMounted(refresh)
               :disabled="tool.is_builtin"
               @click="toggleStatus(tool)"
             >
+              <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3v9" />
+                <path d="M6.6 6.6a8 8 0 1 0 10.8 0" />
+              </svg>
               {{ tool.status === 'disabled' ? '启用' : '停用' }}
             </button>
           </div>
@@ -133,6 +137,9 @@ onMounted(refresh)
 
         <div class="tool-row-side">
           <button class="link-btn" @click="toggleExpand(tool.id)">
+            <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true" :style="expanded[tool.id] ? 'transform: rotate(180deg)' : ''">
+              <path d="m6 9 6 6 6-6" />
+            </svg>
             绑定 Agent（{{ agentCount(tool.id) }}）
           </button>
           <div class="tool-actions">
@@ -141,6 +148,10 @@ onMounted(refresh)
               :disabled="tool.is_builtin"
               @click="openEdit(tool)"
             >
+              <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 20h9" />
+                <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z" />
+              </svg>
               编辑
             </button>
             <button
@@ -148,6 +159,9 @@ onMounted(refresh)
               :disabled="tool.is_builtin"
               @click="remove(tool)"
             >
+              <svg class="icon icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6" />
+              </svg>
               删除
             </button>
           </div>
@@ -178,127 +192,157 @@ onMounted(refresh)
 .tool-search {
   display: flex;
   align-items: center;
-  gap: 0.8rem;
-  margin-bottom: 1rem;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
 }
 .tool-search input {
   flex: 1;
+  min-width: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  font: inherit;
+  font-size: var(--text-base);
+  background: var(--bg-2);
+  color: var(--text-primary);
+  outline: none;
+  transition: border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+.tool-search input::placeholder {
+  color: var(--text-disabled);
+}
+.tool-search input:focus {
+  border-color: var(--primary);
+  box-shadow: var(--shadow-focus);
 }
 .tool-count {
-  font-size: 0.82rem;
-  color: var(--muted, #8c8c8c);
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
   white-space: nowrap;
 }
 .tool-table {
   display: flex;
   flex-direction: column;
-  gap: 0.6rem;
+  gap: var(--space-2);
 }
 .tool-row {
-  border: 1px solid var(--border, #e2e2e2);
-  border-radius: 8px;
-  padding: 0.7rem 0.8rem;
-  background: var(--bg-soft, #fff);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-2);
+  transition: border-color var(--dur-fast) var(--ease-out),
+    background-color var(--dur-fast) var(--ease-out);
+}
+.tool-row:hover {
+  border-color: var(--border-default);
+  background: var(--surface-3);
 }
 .tool-row-main {
   display: flex;
   flex-direction: column;
-  gap: 0.3rem;
+  gap: var(--space-1);
 }
 .tool-name {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: var(--space-2);
   flex-wrap: wrap;
 }
+.tool-name strong {
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  color: var(--text-primary);
+}
 .tool-name code {
-  font-size: 0.78rem;
-  color: var(--muted, #8c8c8c);
+  font-size: var(--text-xs);
 }
 .type-badge {
-  font-size: 0.72rem;
-  padding: 0.05rem 0.4rem;
-  border-radius: 999px;
-  background: var(--accent, #4f6ef7);
-  color: #fff;
+  font-size: var(--text-xs);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--primary-soft);
+  color: var(--primary-hover);
+  border: 1px solid var(--border-default);
 }
 .type-badge.builtin {
-  background: #8a8f98;
+  background: var(--surface-3);
+  color: var(--text-tertiary);
 }
 .tool-desc {
-  font-size: 0.82rem;
-  color: var(--muted, #6b6b6b);
+  font-size: var(--text-sm);
+  color: var(--text-tertiary);
   margin: 0;
+  line-height: var(--leading-normal);
 }
 .tool-meta {
   display: flex;
   align-items: center;
-  gap: 0.6rem;
-  margin-top: 0.2rem;
+  gap: var(--space-3);
+  margin-top: var(--space-1);
 }
 .status-badge {
-  font-size: 0.72rem;
-  padding: 0.05rem 0.45rem;
-  border-radius: 999px;
-  background: #e9f7ef;
-  color: #1d7a3a;
-  border: 1px solid #bfe3cc;
+  font-size: var(--text-xs);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--success-soft);
+  color: var(--success-text);
+  border: 1px solid var(--border-default);
 }
 .status-badge.off {
-  background: #f5f5f5;
-  color: #8c8c8c;
-  border: 1px solid #ddd;
+  background: var(--surface-3);
+  color: var(--text-tertiary);
+  border-color: var(--border-default);
 }
 .tool-row-side {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-top: 0.5rem;
-  gap: 0.6rem;
+  margin-top: var(--space-3);
+  gap: var(--space-3);
   flex-wrap: wrap;
 }
 .tool-actions {
   display: flex;
-  gap: 0.5rem;
+  gap: var(--space-2);
 }
 .link-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
   background: none;
   border: none;
-  color: var(--accent, #4f6ef7);
+  color: var(--primary-hover);
   cursor: pointer;
-  font-size: 0.82rem;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
   padding: 0;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+.link-btn .icon {
+  transition: transform var(--dur-base) var(--ease-out);
+}
+.link-btn:hover:not(:disabled) {
+  color: var(--primary);
 }
 .link-btn:disabled {
-  color: var(--muted, #b8b8b8);
-  cursor: not-allowed;
-}
-.danger-btn {
-  background: none;
-  border: 1px solid #f3c3c3;
-  color: #b3261e;
-  cursor: pointer;
-  font-size: 0.82rem;
-  padding: 0.3rem 0.7rem;
-  border-radius: 6px;
-}
-.danger-btn:disabled {
-  opacity: 0.5;
+  color: var(--text-disabled);
   cursor: not-allowed;
 }
 .tool-agents {
-  margin-top: 0.5rem;
-  padding-top: 0.5rem;
-  border-top: 1px dashed var(--border, #ddd);
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
   display: flex;
   flex-wrap: wrap;
-  gap: 0.4rem;
+  gap: var(--space-2);
 }
 .agent-chip {
-  font-size: 0.78rem;
-  padding: 0.1rem 0.5rem;
-  border-radius: 999px;
-  background: #eef1f6;
-  color: #333;
+  font-size: var(--text-xs);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--surface-3);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
 }
 </style>

@@ -40,11 +40,18 @@ type EntityRelation struct {
 	Target   string `json:"target"`
 }
 
-// ExtractKnowledge 从文本中抽取三元组（本体引导抽取）：
+// ExtractKnowledge 从文本中抽取三元组（无预算计量，保留给调试接口与评测工具）。
+func (k *KAGManager) ExtractKnowledge(ctx context.Context, text string) ([]EntityRelation, error) {
+	return k.ExtractKnowledgeWithBudget(ctx, text, nil)
+}
+
+// ExtractKnowledgeWithBudget 从文本中抽取三元组（本体引导抽取）：
 //   - 注入本体白名单约束 LLM 只能产出规范关系，从源头收敛 schema（试点已证事后字符串归一化无效）；
 //   - recall 导向：尽可能完整抽取，缓解「文档有、图里无」的覆盖不足（命中率低的主导根因）；
 //   - 抽取结果经 CanonicalizeRelation 归一到规范关系名（语义等价类 + 大小写折叠）。
-func (k *KAGManager) ExtractKnowledge(ctx context.Context, text string) ([]EntityRelation, error) {
+//
+// budget 非空时，本次抽取的 LLM 调用纳入计量（kb:build 图谱阶段成本观测）。
+func (k *KAGManager) ExtractKnowledgeWithBudget(ctx context.Context, text string, budget *llm.Budget) ([]EntityRelation, error) {
 	systemPrompt := `你是一个知识图谱信息抽取专家。请阅读以下文本，并从中提取实体和关系。
 提取结果必须严格使用 JSON 数组格式返回，不要包含任何其他说明文字，也不要使用 markdown 代码块标记。
 JSON 格式要求：
@@ -59,7 +66,7 @@ JSON 格式要求：
 
 	userPrompt := "请抽取以下文本的实体关系：\n\n" + text
 
-	resp, err := k.llmClient.Generate(ctx, systemPrompt, nil, userPrompt, nil)
+	resp, err := k.llmClient.GenerateWithBudget(ctx, systemPrompt, userPrompt, budget)
 	if err != nil {
 		return nil, fmt.Errorf("llm extract failed: %v", err)
 	}
@@ -81,28 +88,49 @@ JSON 格式要求：
 	return relations, nil
 }
 
-// IngestGraph 将三元组存入 Neo4j 图数据库
+// IngestGraph 将三元组存入 Neo4j 图数据库（不带来源归属，保留给调试接口与评测工具）。
 func (k *KAGManager) IngestGraph(ctx context.Context, relations []EntityRelation) error {
+	return k.IngestGraphWithSource(ctx, relations, "")
+}
+
+// IngestGraphWithSource 将三元组存入 Neo4j，并给关系打上来源文档归属属性 source_doc。
+// docID 非空时写入来源，使关系可按来源文档失效清理（W3 / D2 修复）；为空时保持旧行为。
+func (k *KAGManager) IngestGraphWithSource(ctx context.Context, relations []EntityRelation, docID string) error {
 	session := k.neo4jDriver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
 	defer session.Close(ctx)
 
+	sourceDoc := strings.TrimSpace(docID)
 	for _, rel := range relations {
 		if strings.TrimSpace(rel.Source) == "" || strings.TrimSpace(rel.Target) == "" || strings.TrimSpace(rel.Relation) == "" {
 			continue
 		}
-		_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
-			// MERGE 会保证节点不存在时创建，存在时不重复创建
-			query := fmt.Sprintf(`
+		relType := cleanRelationName(rel.Relation)
+		params := map[string]any{
+			"source": rel.Source,
+			"target": rel.Target,
+		}
+		var query string
+		if sourceDoc == "" {
+			query = fmt.Sprintf(`
 				MERGE (a:Entity {name: $source})
 				MERGE (b:Entity {name: $target})
 				MERGE (a)-[r:%s]->(b)
 				RETURN id(r)
-			`, cleanRelationName(rel.Relation))
+			`, relType)
+		} else {
+			// source_doc 参与 MERGE：同一文档重复入图不会产生重复边（幂等）。
+			query = fmt.Sprintf(`
+				MERGE (a:Entity {name: $source})
+				MERGE (b:Entity {name: $target})
+				MERGE (a)-[r:%s {source_doc: $doc_id}]->(b)
+				RETURN id(r)
+			`, relType)
+			params["doc_id"] = sourceDoc
+		}
 
-			result, err := tx.Run(ctx, query, map[string]any{
-				"source": rel.Source,
-				"target": rel.Target,
-			})
+		_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+			// MERGE 会保证节点不存在时创建，存在时不重复创建
+			result, err := tx.Run(ctx, query, params)
 			if err != nil {
 				return nil, err
 			}
@@ -111,6 +139,99 @@ func (k *KAGManager) IngestGraph(ctx context.Context, relations []EntityRelation
 
 		if err != nil {
 			log.Printf("Failed to insert relation %s-%s-%s: %v", rel.Source, rel.Relation, rel.Target, err)
+		}
+	}
+	return nil
+}
+
+// DeleteBySourceDoc 删除来源归属于指定文档的全部关系，并清理因此产生的孤立实体节点。
+// 返回删除的关系数。用于文档 / 知识库的失效清理（W3）。
+// 关系类型由本体动态生成，无法按固定类型匹配，故按关系属性 source_doc 过滤。
+func (k *KAGManager) DeleteBySourceDoc(ctx context.Context, docID string) (int64, error) {
+	sourceDoc := strings.TrimSpace(docID)
+	if sourceDoc == "" {
+		return 0, nil
+	}
+	session := k.neo4jDriver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	var deleted int64
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+		countRes, err := tx.Run(ctx,
+			"MATCH ()-[r]->() WHERE r.source_doc = $doc_id RETURN count(r) AS c",
+			map[string]any{"doc_id": sourceDoc})
+		if err != nil {
+			return nil, err
+		}
+		rec, err := countRes.Single(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if c, ok := rec.Get("c"); ok {
+			deleted, _ = c.(int64)
+		}
+
+		delRes, err := tx.Run(ctx,
+			"MATCH ()-[r]->() WHERE r.source_doc = $doc_id DELETE r",
+			map[string]any{"doc_id": sourceDoc})
+		if err != nil {
+			return nil, err
+		}
+		if _, err := delRes.Consume(ctx); err != nil {
+			return nil, err
+		}
+
+		// 删除关系后清理不再被任何关系引用的孤立实体节点。
+		orphanRes, err := tx.Run(ctx, "MATCH (n:Entity) WHERE NOT (n)--() DELETE n", nil)
+		if err != nil {
+			return nil, err
+		}
+		_, err = orphanRes.Consume(ctx)
+		return nil, err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("kag: delete by source doc %s: %w", sourceDoc, err)
+	}
+	return deleted, nil
+}
+
+// EnsureSourceDocIndex 为现有全部关系类型建立 source_doc 属性索引（Neo4j 5 关系索引），
+// 使「按来源文档清理」不必全图扫描。幂等：已存在的索引不会重复创建。
+// 关系类型由本体动态生成，故先枚举现有类型再逐个建索引；新建类型需再次调用本方法。
+func (k *KAGManager) EnsureSourceDocIndex(ctx context.Context) error {
+	session := k.neo4jDriver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	result, err := session.Run(ctx,
+		"CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType", nil)
+	if err != nil {
+		return fmt.Errorf("kag: list relationship types: %w", err)
+	}
+	var relTypes []string
+	for result.Next(ctx) {
+		v, ok := result.Record().Get("relationshipType")
+		if !ok {
+			continue
+		}
+		if s, ok := v.(string); ok && s != "" {
+			relTypes = append(relTypes, s)
+		}
+	}
+	if err := result.Err(); err != nil {
+		return fmt.Errorf("kag: iterate relationship types: %w", err)
+	}
+
+	for _, rt := range relTypes {
+		idxName := "rel_source_doc_" + strings.ToLower(rt)
+		stmt := fmt.Sprintf("CREATE INDEX %s IF NOT EXISTS FOR ()-[r:%s]-() ON (r.source_doc)", idxName, rt)
+		if _, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (any, error) {
+			res, err := tx.Run(ctx, stmt, nil)
+			if err != nil {
+				return nil, err
+			}
+			return res.Consume(ctx)
+		}); err != nil {
+			return fmt.Errorf("kag: create source_doc index for %s: %w", rt, err)
 		}
 	}
 	return nil
