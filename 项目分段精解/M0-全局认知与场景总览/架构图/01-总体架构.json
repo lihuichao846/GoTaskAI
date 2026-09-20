@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "GoTaskAI 总体架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/lihuichao846/GoTaskAI",
+      "provider": "github",
+      "revision": "ae58b121319f73d4ccc833bc6cde355f218649a1"
+    },
+    "views": [
+      {
+        "id": "sync-request",
+        "label": "同步请求：接客与鉴权",
+        "focus": ["browser", "nginx", "api", "mysql"],
+        "note": "浏览器经 Nginx 进入 API 进程，身份与元数据落在 MySQL。"
+      },
+      {
+        "id": "async-task",
+        "label": "异步任务：投递与消费",
+        "focus": ["api", "asynq", "worker", "mysql"],
+        "note": "API 只投递并立刻返回 202，重计算全部交给 Worker。"
+      },
+      {
+        "id": "retrieval",
+        "label": "检索与生成",
+        "focus": ["worker", "milvus", "neo4j", "llm", "mcp"],
+        "note": "向量双路召回与图谱多跳并行，最后交给模型生成。"
+      },
+      {
+        "id": "event-push",
+        "label": "事件与实时推送",
+        "focus": ["worker", "nats", "api", "browser"],
+        "note": "任务状态经 NATS 回到 API，再用 SSE 推给浏览器。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "browser",
+      "type": "frontend",
+      "label": "浏览器 / Vue3 前端",
+      "sublabel": "五视图 · SSE",
+      "tag": "表现层",
+      "pos": [30, 330],
+      "size": [122, 62],
+      "sources": [{ "path": "web/src/App.vue", "line": 242, "label": "createTaskStream" }]
+    },
+    {
+      "id": "nginx",
+      "type": "cloud",
+      "label": "Nginx",
+      "sublabel": "静态托管 + 反代",
+      "tag": "接入层",
+      "pos": [232, 330],
+      "size": [122, 62],
+      "sources": [
+        { "path": "nginx.conf", "line": 36, "label": "/api/ 反向代理" },
+        { "path": "nginx.conf", "line": 46, "label": "SSE 关闭缓冲" }
+      ]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "API 进程 cmd/api",
+      "sublabel": "接客 · 投递 · SSE · 202",
+      "tag": "进程 A",
+      "pos": [434, 330],
+      "size": [134, 66],
+      "sources": [
+        { "path": "cmd/api/main.go", "line": 117, "label": "/metrics 端点" },
+        { "path": "internal/api/handler.go", "label": "SSE 推送端点" }
+      ]
+    },
+    {
+      "id": "nats",
+      "type": "messagebus",
+      "label": "NATS 事件总线",
+      "sublabel": "内嵌于 API 进程",
+      "tag": "进程 A",
+      "pos": [434, 170],
+      "size": [134, 62],
+      "sources": [
+        { "path": "internal/events/events.go", "line": 25, "label": "三个 global_* subject" },
+        { "path": "internal/events/events.go", "line": 82, "label": "内嵌 nats-server" }
+      ]
+    },
+    {
+      "id": "asynq",
+      "type": "messagebus",
+      "label": "Redis + Asynq 队列",
+      "sublabel": "high / default / low",
+      "tag": "存储",
+      "pos": [648, 330],
+      "size": [134, 66],
+      "sources": [{ "path": "internal/queue/manager.go", "line": 205, "label": "优先级映射三队列" }]
+    },
+    {
+      "id": "worker",
+      "type": "backend",
+      "label": "Worker 进程组",
+      "sublabel": "1 supervisor + N 子进程",
+      "tag": "进程 B",
+      "pos": [862, 330],
+      "size": [144, 66],
+      "sources": [
+        { "path": "cmd/worker/main.go", "line": 67, "label": "supervisor 拉起子进程" },
+        { "path": "cmd/worker/main.go", "line": 230, "label": "指标端口 base+i+1" }
+      ]
+    },
+    {
+      "id": "mysql",
+      "type": "database",
+      "label": "MySQL 8.0",
+      "sublabel": "状态真相 :3307",
+      "tag": "存储",
+      "pos": [1186, 150],
+      "size": [132, 62],
+      "sources": [
+        { "path": "internal/model/task.go", "label": "任务状态模型" },
+        { "path": "internal/queue/manager.go", "line": 221, "label": "MaxRetry(3) 投递" }
+      ]
+    },
+    {
+      "id": "milvus",
+      "type": "database",
+      "label": "Milvus 2.4.4",
+      "sublabel": "向量双路 :19530",
+      "tag": "存储",
+      "pos": [1186, 332],
+      "size": [132, 62],
+      "sources": [{ "path": "internal/pkg/ragstore/store.go", "line": 183, "label": "HNSW 检索参数" }]
+    },
+    {
+      "id": "neo4j",
+      "type": "database",
+      "label": "Neo4j 5.18",
+      "sublabel": "图谱 KAG :7687",
+      "tag": "存储",
+      "pos": [1186, 510],
+      "size": [132, 62],
+      "sources": [{ "path": "internal/pkg/kag/kag.go", "label": "KAG 抽取与入图" }]
+    },
+    {
+      "id": "mcp",
+      "type": "external",
+      "label": "search_mcp",
+      "sublabel": "stdio · SerpApi",
+      "tag": "worker 子进程",
+      "pos": [700, 540],
+      "size": [152, 62],
+      "sources": [
+        { "path": "internal/pkg/mcpclient/client.go", "line": 24, "label": "stdio 连接" },
+        { "path": "internal/pkg/mcpclient/client.go", "line": 38, "label": "SSE 远程连接" }
+      ]
+    },
+    {
+      "id": "llm",
+      "type": "external",
+      "label": "LLM / Embedding / 重排",
+      "sublabel": "DeepSeek + DashScope",
+      "tag": "外部服务",
+      "pos": [858, 636],
+      "size": [152, 62],
+      "sources": [{ "path": "internal/pkg/llm/client.go", "label": "Chat / Embedding 客户端" }]
+    }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "进程 A：cmd/api（接客 + 投递 + 内嵌 NATS）", "wraps": ["api", "nats"], "pad": 16 },
+    { "kind": "region", "label": "进程 B：cmd/worker（supervisor + 子进程）", "wraps": ["worker"], "pad": 16 }
+  ],
+  "connections": [
+    { "from": "browser", "to": "nginx", "label": "HTTPS", "variant": "emphasis" },
+    { "from": "nginx", "to": "api", "label": "/api 反代", "variant": "emphasis" },
+    { "from": "api", "to": "asynq", "label": "投递任务", "variant": "emphasis" },
+    { "from": "asynq", "to": "worker", "label": "消费队列", "variant": "emphasis" },
+    { "from": "worker", "to": "mysql", "label": "任务状态回写", "fromSide": "right", "toSide": "left", "via": [[1106, 363], [1106, 181]] },
+    { "from": "worker", "to": "milvus", "label": "向量检索", "fromSide": "right", "toSide": "left", "route": "straight", "labelDx": 45, "labelDy": -24 },
+    { "from": "worker", "to": "neo4j", "label": "图谱多跳", "fromSide": "right", "toSide": "left", "via": [[1146, 363], [1146, 541]] },
+    { "from": "worker", "to": "llm", "label": "生成 / 向量化 / 重排", "fromSide": "bottom", "toSide": "top", "labelAt": [934, 530] },
+    { "from": "worker", "to": "mcp", "label": "stdio 工具调用", "fromSide": "bottom", "toSide": "top" },
+    { "from": "worker", "to": "nats", "label": "发布 task_update", "variant": "dashed", "fromSide": "top", "toSide": "right", "via": [[934, 201]] },
+    { "from": "api", "to": "nats", "label": "订阅 + 广播 task_cancel", "variant": "dashed", "fromSide": "top", "toSide": "bottom" },
+    { "from": "api", "to": "browser", "label": "SSE 实时推送", "variant": "dashed", "fromSide": "bottom", "toSide": "bottom", "via": [[501, 470], [91, 470]] }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "四层骨架",
+      "items": [
+        "接入：Nginx 静态托管 + /api 反代",
+        "编排：cmd/api 只接客与投递，返回 202",
+        "执行：supervisor + N 子进程消费队列",
+        "存储：MySQL / Redis / Milvus / Neo4j"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "两条消息通道",
+      "items": [
+        "Asynq 管任务：可靠、可重试、跨进程",
+        "NATS 管事件：实时、可丢、进程内",
+        "隔开的动机：Redis 故障不波及推送",
+        "三队列是权重，不是抢占"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "讲述锚点",
+      "items": [
+        "真相只在 MySQL；Redis/NATS 只负责快",
+        "每个方框可点 SRC 回到源码行号",
+        "M7 是执行核心，X1 在检索之前"
+      ]
+    }
+  ]
+}
