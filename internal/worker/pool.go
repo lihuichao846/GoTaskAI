@@ -168,7 +168,59 @@ func NewPool(workers int, manager *queue.TaskManager, redisOpt asynq.RedisConnOp
 	// 订阅任务取消控制指令（NATS 广播）：命中本进程在途任务时中断其进行中的 LLM 调用。
 	manager.SubscribeTaskCancel(pool.cancelTask)
 
+	// 启动时对上下文装载/压缩相关配置做一次静态体检（只告警、不阻断启动）。
+	checkContextConfig(config.AppConfig.LLM, config.AppConfig.Compress)
+
 	return pool
+}
+
+// checkContextConfig 对上下文装载/压缩相关配置做一次静态体检，发现明显矛盾时打印告警。
+//
+// 为什么需要：这些参数分散在两个配置段（llm / compress）、由不同代码读取，且没有任何一致性校验。
+// 把它们配成互相矛盾的值（例如沿用旧语义的 max_load_turns=20）不会报错，
+// 只会静默地让压缩永不触发——这正是改造前"压缩形同死代码"的成因。
+// 这里把"能静态发现的错配"在启动时暴露出来。
+//
+// 注意：只告警、不阻断启动（配置可疑不等于配置错误）。
+func checkContextConfig(lc config.LLMConfig, cc config.CompressConfig) {
+	if !cc.Enabled {
+		log.Println("[Worker] context compress disabled (compress.enabled=false): history is loaded by max_load_turns only")
+		return
+	}
+	if lc.ContextWindow <= 0 {
+		log.Printf("[Worker][WARN] compress.enabled=true 但 llm.context_window=%d：无法计算装载预算，压缩不会触发",
+			lc.ContextWindow)
+		return
+	}
+
+	// 装载窗口过小：会让压缩每轮都触发，且 keepRecent 保底可能直接顶破预算。
+	if cc.MaxLoadTurns > 0 && cc.MaxLoadTurns <= cc.KeepRecent {
+		log.Printf("[Worker][ALERT] compress.max_load_turns(%d) <= keep_recent(%d)：装载窗口过小，压缩会持续触发",
+			cc.MaxLoadTurns, cc.KeepRecent)
+	}
+
+	// 旧值残留：新语义下该值是"安全上限"（默认 200），若仍在 20 附近多半是没更新配置，
+	// 会让可装载轮数被旧值卡住，压缩依然很难被触发。
+	if cc.MaxLoadTurns > 0 && cc.MaxLoadTurns <= 50 {
+		log.Printf("[Worker][ALERT] compress.max_load_turns=%d 疑似沿用旧值 20：装载本应由 token 预算驱动，"+
+			"该值过小会限制可装载轮数，建议改为 200", cc.MaxLoadTurns)
+	}
+
+	// 单批压缩输入上限不应达到窗口本身，否则压缩请求自己就会溢出（客户端硬校验会直接拒绝）。
+	if cc.MaxCompressInputTokens > 0 && cc.MaxCompressInputTokens+lc.OutputReserve > lc.ContextWindow {
+		log.Printf("[Worker][ALERT] compress.max_compress_input_tokens(%d) + output_reserve(%d) > context_window(%d)："+
+			"压缩请求自身会溢出，请调小前者", cc.MaxCompressInputTokens, lc.OutputReserve, lc.ContextWindow)
+	}
+
+	if lc.OutputReserve <= 0 {
+		log.Println("[Worker][WARN] llm.output_reserve<=0：未为模型输出预留空间，长回答可能被截断")
+	}
+	if lc.MaxOutputTokens <= 0 {
+		log.Println("[Worker][WARN] llm.max_output_tokens<=0：未显式设置 max_tokens，将沿用供应商默认值")
+	}
+
+	log.Printf("[Worker] context config: window=%d budget_ratio=%.2f max_load_turns=%d keep_recent=%d min_turns=%d",
+		lc.ContextWindow, cc.BudgetRatio, cc.MaxLoadTurns, cc.KeepRecent, cc.MinTurns)
 }
 
 // Start 启动 Asynq Server 开始消费任务。
@@ -609,22 +661,300 @@ func (p *Pool) retrieveTopDocs(ctx context.Context, query, kbID string, topK int
 	return docs, nil
 }
 
-// loadConversationHistory 按 token 预算加载会话历史，并在上下文达到阈值时自动压缩较早轮次为摘要。
-// 返回给 LLM 的消息切片：最前是一条「此前对话摘要」system 消息（若已存在摘要），其后为最近保留的原始轮次。
-func (p *Pool) loadConversationHistory(ctx context.Context, conversationID string, systemPrompt string, userPrompt string) []openai.ChatCompletionMessage {
+// AgentCredential 描述调用模型所用的一组凭证；各字段为空时回退到全局默认配置。
+// 用于让"压缩"这类内部调用与主生成走同一套凭证（避免 Agent 的对话内容外发到全局默认厂商）。
+type AgentCredential struct {
+	APIKey  string
+	BaseURL string
+	Model   string
+}
+
+// taskToMessages 把一条任务（一轮对话）换算为 user / assistant 两条消息。
+// 只有 completed 的轮次会被装载，因此 Result 一般为非空。
+func taskToMessages(t *model.Task) []openai.ChatCompletionMessage {
+	msgs := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleUser, Content: t.Payload},
+	}
+	if t.Result != "" {
+		msgs = append(msgs, openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleAssistant,
+			Content: t.Result,
+		})
+	}
+	return msgs
+}
+
+// buildHistory 组装「摘要 system 消息 + 已装载的原始轮次」（轮次按时间升序）。
+func buildHistory(summaryText string, recent []*model.Task) []openai.ChatCompletionMessage {
+	var hist []openai.ChatCompletionMessage
+	if strings.TrimSpace(summaryText) != "" {
+		hist = append(hist, openai.ChatCompletionMessage{
+			Role: openai.ChatMessageRoleSystem,
+			Content: "以下是此前对话的压缩摘要，请结合它理解上下文，避免与用户重复确认过去已确定的内容：\n" +
+				strings.TrimSpace(summaryText),
+		})
+	}
+	for _, t := range recent {
+		hist = append(hist, taskToMessages(t)...)
+	}
+	return hist
+}
+
+// loadBudgetTokens 计算可用于装载历史的 token 预算。
+//
+// 必须扣除 summary 与 tools schema，否则会低估实际输入：
+//   - summary 会以一条 system 消息进入历史，确实占用输入；
+//   - tools schema 由供应商计入输入，而 EstimateMessagesTokens 不覆盖它。
+//
+// 漏掉任一项，"预算内"就不等于"窗口内"。
+func loadBudgetTokens(systemPrompt, userPrompt, summary string, tools []toolregistry.Tool,
+	lc config.LLMConfig, cc config.CompressConfig) int {
+
+	ratio := cc.BudgetRatio
+	if ratio <= 0 || ratio >= 1 {
+		ratio = 0.6
+	}
+	budget := int(float64(lc.ContextWindow) * ratio)
+	budget -= llm.EstimateTokens(systemPrompt)
+	budget -= llm.EstimateTokens(userPrompt)
+	budget -= llm.EstimateTokens(summary)
+	budget -= llm.EstimateToolsTokens(tools)
+	if lc.OutputReserve > 0 {
+		budget -= lc.OutputReserve
+	}
+	if budget < 0 {
+		budget = 0
+	}
+	return budget
+}
+
+// greedyLoad 在预算内【从最近往前】装载历史轮次，返回（按时间升序的轮次, 已用 token）。
+//
+// keepRecent 是"最低保障轮数"：即便预算被 system / 工具 schema 吃光，也要保留最近若干轮，
+// 否则模型看不到当前对话的直接上文。为免该保底把输入撑爆，超出预算 1.5 倍时会
+// 从最旧的轮次开始裁剪（硬容忍带）。
+func greedyLoad(turns []*model.Task, budgetTok int, keepRecent int) ([]*model.Task, int) {
+	if len(turns) == 0 {
+		return nil, 0
+	}
+
+	reversed := make([]*model.Task, 0, len(turns))
+	used := 0
+	for i := len(turns) - 1; i >= 0; i-- {
+		cost := llm.EstimateMessagesTokens("", taskToMessages(turns[i]), "")
+		if used+cost > budgetTok && len(reversed) >= keepRecent {
+			break // 预算用尽，且已保住最近 keepRecent 轮
+		}
+		reversed = append(reversed, turns[i])
+		used += cost
+	}
+
+	// 反转为时间升序（大模型 prompt 的阅读顺序）
+	out := make([]*model.Task, len(reversed))
+	for i, t := range reversed {
+		out[len(reversed)-1-i] = t
+	}
+
+	// 硬容忍带：keepRecent 保底可能使装载量突破预算（例如最近几轮本身极长）。
+	if budgetTok > 0 {
+		limit := budgetTok + budgetTok/2
+		for len(out) > 1 && used > limit {
+			used -= llm.EstimateMessagesTokens("", taskToMessages(out[0]), "")
+			out = out[1:]
+		}
+		if used > limit {
+			log.Printf("[Worker][WARN] context load exceeds budget tolerance: used=%d budget=%d turns=%d",
+				used, budgetTok, len(out))
+		}
+	}
+	return out, used
+}
+
+// truncateMessages 把一组消息的总内容截断到约 maxTokens（保留角色结构）。
+// 仅用于"单轮内容就超出单批压缩预算"的极端情形——不截断的话该轮会把整批撑爆，
+// 使单批输入上限形同虚设。
+func truncateMessages(msgs []openai.ChatCompletionMessage, maxTokens int) []openai.ChatCompletionMessage {
+	if maxTokens <= 0 {
+		return nil
+	}
+	out := make([]openai.ChatCompletionMessage, 0, len(msgs))
+	remaining := maxTokens
+	for _, m := range msgs {
+		cost := llm.EstimateTokens(m.Content) + 4
+		if cost <= remaining {
+			out = append(out, m)
+			remaining -= cost
+			continue
+		}
+		if remaining <= 4 {
+			break
+		}
+		m.Content = llm.TruncateToTokens(m.Content, remaining-4)
+		out = append(out, m)
+		remaining = 0
+	}
+	return out
+}
+
+// compressForward 沿时间轴【由旧向新】分批压缩历史，推进压缩游标。
+//
+// 方向为什么必须是"由旧向新"：装载查询只取最新的若干轮（DESC LIMIT），
+// 装载窗口之外的更早轮次**永远不会出现在装载结果里**。只有从最旧开始分批压缩、
+// 并让游标持续前移，这些轮次才可能被覆盖——这是"信息不再永久丢失"的关键。
+//
+// 返回（新摘要, 新游标, 已压缩轮数, 是否有有效进展）。
+// 某批失败时返回【已成功的前缀】：批次自旧向新连续消费，前缀与游标一致，可安全提交。
+func (p *Pool) compressForward(ctx context.Context, conversationID string, cred AgentCredential,
+	summaryBase string, cutoff *time.Time, unloaded, minTurns int, budget *llm.Budget) (string, time.Time, int, bool) {
+
+	cc := config.AppConfig.Compress
+	maxIn := cc.MaxCompressInputTokens
+	if maxIn <= 0 {
+		maxIn = 30000
+	}
+	batchTurns := cc.MaxCompressTurns
+	if batchTurns <= 0 {
+		batchTurns = 50
+	}
+	maxRounds := cc.MaxCompressRounds
+	if maxRounds <= 0 {
+		maxRounds = 10
+	}
+
+	// 压缩使用【独立预算】：限制压缩自身的调用次数，不占用主任务的 max_calls_per_task 配额
+	// （否则一轮超长会话的压缩就会吃光整个任务的模型调用额度）。
+	// 一批 = 一次调用，故其上限即批数上限。
+	compressBudget := &llm.Budget{MaxCalls: maxRounds}
+
+	cur := summaryBase
+	curCutoff := cutoff
+	compressed := 0
+	rounds := 0
+
+	for round := 0; round < maxRounds; round++ {
+		if err := compressBudget.BeforeCall(); err != nil {
+			log.Printf("[Worker][WARN] conversation %s compress budget exhausted after %d batches",
+				conversationID, rounds)
+			break
+		}
+
+		batch := p.manager.GetOldestConversationBatch(conversationID, curCutoff, batchTurns)
+		if len(batch) == 0 {
+			break
+		}
+
+		// 单批可用输入 = 上限 − 已有摘要 − 提示词模板开销。
+		avail := maxIn - llm.EstimateTokens(cur) - llm.CompressPromptOverheadTokens
+		if avail <= 0 {
+			// 摘要自身已占满配额：继续压缩不会让输入变小，停止以避免死循环。
+			log.Printf("[Worker][WARN] conversation %s summary occupies full compress budget, stop", conversationID)
+			break
+		}
+
+		var msgs []openai.ChatCompletionMessage
+		usedIn := 0
+		turnsInBatch := 0
+		var lastTurn *model.Task
+		for _, t := range batch {
+			turnMsgs := taskToMessages(t)
+			cost := llm.EstimateMessagesTokens("", turnMsgs, "")
+			if cost > avail {
+				turnMsgs = truncateMessages(turnMsgs, avail)
+				cost = llm.EstimateMessagesTokens("", turnMsgs, "")
+				log.Printf("[Worker][WARN] single turn exceeds compress batch budget, truncated (task=%s)", t.ID)
+			}
+			if usedIn+cost > avail && len(msgs) > 0 {
+				break // 本批已满，剩余留给下一批
+			}
+			msgs = append(msgs, turnMsgs...) // 整轮加入，不拆散 user/assistant
+			usedIn += cost
+			lastTurn = t
+			turnsInBatch++
+		}
+		if len(msgs) == 0 || lastTurn == nil {
+			break
+		}
+
+		metrics.CompressTotal.Inc()
+		out, err := p.llmClient.CompressHistoryAs(ctx, cred.APIKey, cred.BaseURL, cred.Model, cur, msgs, compressBudget)
+		if err != nil {
+			metrics.CompressFailed.Inc()
+			log.Printf("[Worker][ALERT] conversation %s compress batch failed: %v", conversationID, err)
+			break // 前缀提交：已成功批次的结果仍然有效
+		}
+
+		cur = out
+		curCutoff = &lastTurn.CreatedAt
+		compressed += turnsInBatch
+		rounds++
+
+		if unloaded-compressed < minTurns {
+			break // 剩余历史已能被预算装下
+		}
+	}
+
+	if rounds > 0 {
+		metrics.CompressRoundsPerRequest.Observe(float64(rounds))
+	}
+
+	// 摘要长度上限：滚动摘要在理论上只增不减，超过上限时做一次精简。
+	// 仅当结果确实更短才采纳，否则计数后停止——避免每轮都白花一次调用（收敛判据）。
+	if compressed > 0 && curCutoff != nil {
+		if maxSummary := cc.MaxSummaryTokens; maxSummary > 0 && llm.EstimateTokens(cur) > maxSummary {
+			if err := compressBudget.BeforeCall(); err != nil {
+				log.Printf("[Worker][WARN] conversation %s skip summary compress: budget exhausted", conversationID)
+			} else {
+				shorter, err := p.llmClient.CompressHistoryAs(ctx, cred.APIKey, cred.BaseURL, cred.Model, "",
+					[]openai.ChatCompletionMessage{{
+						Role:    openai.ChatMessageRoleUser,
+						Content: "请将以下摘要进一步精简，只保留最关键的事实与结论：\n" + cur,
+					}}, compressBudget)
+				if err == nil && llm.EstimateTokens(shorter) < llm.EstimateTokens(cur) {
+					cur = shorter
+				} else {
+					metrics.SummaryCompressIneffective.Inc()
+					log.Printf("[Worker][WARN] summary compress ineffective (conv=%s, tokens=%d, limit=%d)",
+						conversationID, llm.EstimateTokens(cur), maxSummary)
+				}
+			}
+		}
+	}
+
+	// 把压缩的 token 计量并入主账本（"配额独立、成本合并"）：
+	// 压缩不占用主任务调用配额，但其 token 消耗是真实成本，漏掉会让 CostUSD 系统性低估。
+	// 只在此处合并一次——AddUsage 接收的是 compressBudget 的【累计值】，多次调用会重复累加。
+	if budget != nil {
+		budget.AddUsage(compressBudget.TokensIn, compressBudget.TokensOut, compressBudget.TokensCached)
+	}
+
+	if compressed == 0 || curCutoff == nil {
+		return "", time.Time{}, 0, false
+	}
+	return cur, *curCutoff, compressed, true
+}
+
+// loadConversationHistory 装载会话历史并维护滚动摘要。
+//
+// 核心语义（改造后）：
+//  1. 装载量由 token 预算决定（窗口 × budget_ratio，再扣除 system / 用户输入 / 摘要 / 工具 schema / 输出预留）；
+//     max_load_turns 仅防极端，**不再是记忆边界**。
+//  2. 溢出量由 SQL COUNT 得出，覆盖"游标之后整个会话"的轮次，而非装载查询窗口之内。
+//  3. 溢出达到 min_turns 时，由 compressForward 沿时间轴【由旧向新】分批压缩并推进游标，
+//     因此更早的轮次不会因为"不在最新的 N 条里"而永久丢失。
+//  4. 摘要以 CAS 写入；并发时败者丢弃本次结果（下次请求自然收敛）。
+//
+// 返回给 LLM 的消息切片：最前是一条「此前对话摘要」system 消息（若已存在摘要），
+// 其后为按时间升序排列的原始轮次。
+func (p *Pool) loadConversationHistory(ctx context.Context, conversationID string, systemPrompt string,
+	userPrompt string, cred AgentCredential, tools []toolregistry.Tool, budget *llm.Budget) []openai.ChatCompletionMessage {
+
 	cc := config.AppConfig.Compress
 	lc := config.AppConfig.LLM
 
-	// 触发压缩的 token 阈值 = 上下文窗口 × 压缩比例。
-	threshold := int(float64(lc.ContextWindow) * lc.CompressThreshold)
-	if lc.ContextWindow <= 0 || lc.CompressThreshold <= 0 {
-		threshold = 0 // 未配置阈值时不压缩
-	}
-
 	// 配置缺省值兜底。
-	maxHistory := cc.MaxHistory
-	if maxHistory <= 0 {
-		maxHistory = 20
+	maxLoadTurns := cc.MaxLoadTurns
+	if maxLoadTurns <= 0 {
+		maxLoadTurns = 200
 	}
 	keepRecent := cc.KeepRecent
 	if keepRecent <= 0 {
@@ -635,89 +965,59 @@ func (p *Pool) loadConversationHistory(ctx context.Context, conversationID strin
 		minTurns = keepRecent + 2
 	}
 
-	// 已压缩到哪条任务：避免重复取到已被记忆进摘要的旧轮次。
 	summary, cutoff := p.manager.GetConversationCompressState(conversationID)
 
-	var turns []*model.Task
-	if cc.Enabled {
-		turns = p.manager.GetConversationHistorySince(conversationID, cutoff, maxHistory)
-	} else {
-		turns = p.manager.GetConversationHistory(conversationID, maxHistory)
+	// 压缩关闭、或未配置窗口：退化为"按安全上限装载"，不做压缩（等价改造前行为）。
+	if !cc.Enabled || lc.ContextWindow <= 0 {
+		turns := p.manager.GetConversationHistory(conversationID, maxLoadTurns)
+		return buildHistory(summary, turns)
 	}
 
-	// taskToMessages 把一条任务换算为 user/assistant 两个消息。
-	taskToMessages := func(ht *model.Task) []openai.ChatCompletionMessage {
-		msgs := []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleUser, Content: ht.Payload},
-		}
-		if ht.Result != "" {
-			msgs = append(msgs, openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleAssistant,
-				Content: ht.Result,
-			})
-		}
-		return msgs
+	// ── 真实溢出：COUNT 不受装载查询的 LIMIT 影响，能看到"窗口之外"还有多少轮 ──
+	totalRemaining := int(p.manager.CountConversationHistorySince(conversationID, cutoff))
+	recent := p.manager.GetConversationHistorySince(conversationID, cutoff, maxLoadTurns)
+
+	budgetTok := loadBudgetTokens(systemPrompt, userPrompt, summary, tools, lc, cc)
+	loaded, used := greedyLoad(recent, budgetTok, keepRecent)
+	unloaded := totalRemaining - len(loaded)
+
+	metrics.ContextTotalTurns.Observe(float64(totalRemaining))
+	metrics.ContextLoadedTurns.Observe(float64(len(loaded)))
+	metrics.ContextUnloadedTurns.Observe(float64(unloaded))
+	if budgetTok > 0 {
+		metrics.ContextBudgetUsedRatio.Observe(float64(used) / float64(budgetTok))
 	}
 
-	// buildHistory 组装「摘要 system 消息 + 最近原始轮次」。
-	buildHistory := func(summaryText string, recent []*model.Task) []openai.ChatCompletionMessage {
-		var hist []openai.ChatCompletionMessage
-		if strings.TrimSpace(summaryText) != "" {
-			hist = append(hist, openai.ChatCompletionMessage{
-				Role:    openai.ChatMessageRoleSystem,
-				Content: "以下是此前对话的压缩摘要，请结合它理解上下文，避免与用户重复确认过去已确定的内容：\n" + strings.TrimSpace(summaryText),
-			})
-		}
-		for _, t := range recent {
-			hist = append(hist, taskToMessages(t)...)
-		}
-		return hist
+	if unloaded < minTurns {
+		return buildHistory(summary, loaded)
 	}
 
-	hist := buildHistory(summary, turns)
-
-	// 未启用压缩、或阈值未配置：直接返回原始历史。
-	if !cc.Enabled || threshold <= 0 {
-		return hist
+	// ── 存在真实溢出：由旧向新分批压缩，推进游标 ──
+	newSummary, newCutoff, compressed, ok := p.compressForward(
+		ctx, conversationID, cred, summary, cutoff, unloaded, minTurns, budget)
+	if !ok || compressed == 0 {
+		// 压缩未取得任何进展：本轮上下文缺少这 unloaded 轮（下次请求会重试）。
+		log.Printf("[Worker][ALERT] conversation %s compress made no progress, "+
+			"this turn loses %d older turns from context", conversationID, unloaded)
+		return buildHistory(summary, loaded)
 	}
 
-	used := llm.EstimateMessagesTokens(systemPrompt, hist, userPrompt)
-	if used <= threshold {
-		return hist
+	if !p.manager.SaveConversationSummaryCAS(conversationID, newSummary, newCutoff) {
+		// CAS 失败：并发的另一轮已把游标推进得更远。丢弃本次摘要，按最新状态重新装载。
+		s2, c2 := p.manager.GetConversationCompressState(conversationID)
+		recent2 := p.manager.GetConversationHistorySince(conversationID, c2, maxLoadTurns)
+		loaded2, _ := greedyLoad(recent2, loadBudgetTokens(systemPrompt, userPrompt, s2, tools, lc, cc), keepRecent)
+		return buildHistory(s2, loaded2)
 	}
 
-	// 全部轮次都在保留窗口内（无需/无法压缩），保持原样。
-	if len(turns) <= keepRecent || len(turns) < minTurns {
-		return hist
-	}
+	// 压缩成功：摘要可能变长，需按新摘要重算预算后重新装载。
+	budgetTok2 := loadBudgetTokens(systemPrompt, userPrompt, newSummary, tools, lc, cc)
+	recent2 := p.manager.GetConversationHistorySince(conversationID, &newCutoff, maxLoadTurns)
+	loaded2, _ := greedyLoad(recent2, budgetTok2, keepRecent)
 
-	// 需要压缩：把最早的 (len(turns)-keepRecent) 轮压缩为摘要，仅保留最近 keepRecent 轮原始消息。
-	split := len(turns) - keepRecent
-	toCompress := turns[:split]
-	recent := turns[split:]
-
-	var toCompressMsgs []openai.ChatCompletionMessage
-	for _, t := range toCompress {
-		toCompressMsgs = append(toCompressMsgs, taskToMessages(t)...)
-	}
-
-	metrics.CompressTotal.Inc()
-	newSummary, err := p.llmClient.CompressHistory(ctx, "", summary, toCompressMsgs)
-	if err != nil {
-		// 压缩失败属可告警信号：静默回退全量历史会放大后续 token 成本，需能被观测/告警。
-		metrics.CompressFailed.Inc()
-		log.Printf("[Worker][ALERT] conversation compress failed, keeping full history: %v", err)
-		return hist
-	}
-
-	// 持久化摘要与 cutoff（cutoff 指向被压缩的最后一轮的创建时间）。
-	cutoffTime := toCompress[len(toCompress)-1].CreatedAt
-	if err := p.manager.SaveConversationSummary(conversationID, newSummary, &cutoffTime); err != nil {
-		log.Printf("[Worker] failed to persist conversation summary: %v", err)
-	}
-
-	log.Printf("[Worker] conversation %s compressed %d historic turns into summary", conversationID, len(toCompress))
-	return buildHistory(newSummary, recent)
+	log.Printf("[Worker] conversation %s compressed %d older turns into summary, loaded %d turns",
+		conversationID, compressed, len(loaded2))
+	return buildHistory(newSummary, loaded2)
 }
 
 // handleTaskProcess 是 Asynq 路由的处理函数，负责处理实际的 AI 任务。
@@ -765,10 +1065,11 @@ func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) err
 		log.Printf("[Worker] max_total_calls_per_task not configured, using default %d", maxTotalCalls)
 	}
 	budget := &llm.Budget{
-		MaxCalls:           maxCalls,
-		MaxTotalCalls:      maxTotalCalls,
-		PriceInUSDPerMTok:  config.AppConfig.LLM.CostPer1MIn,
-		PriceOutUSDPerMTok: config.AppConfig.LLM.CostPer1MOut,
+		MaxCalls:                maxCalls,
+		MaxTotalCalls:           maxTotalCalls,
+		PriceInUSDPerMTok:       config.AppConfig.LLM.CostPer1MIn,
+		PriceInUSDPerMTokCached: config.AppConfig.LLM.CostPer1MInCached,
+		PriceOutUSDPerMTok:      config.AppConfig.LLM.CostPer1MOut,
 	}
 	if usageTask, ok := p.manager.GetTask(t.ID); ok {
 		budget.SetBase(usageTask.TotalCalls, usageTask.TotalTokensIn, usageTask.TotalTokensOut)
@@ -857,18 +1158,11 @@ func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) err
 		}
 	}
 
-	var historyMessages []openai.ChatCompletionMessage
-	conversationID := t.ConversationID
-	if conversationID == "" {
-		conversationID = t.SessionID // 兼容旧数据：无 ConversationID 时回退 SessionID
-	}
-	if conversationID != "" {
-		// 按 token 预算加载会话历史；当上下文达到窗口阈值时自动压缩较早轮次为摘要。
-		historyMessages = p.loadConversationHistory(ctx, conversationID, systemPrompt, t.Payload)
-	}
-
 	// 可取消 ctx 派生：以 asynq 传入的 ctx 为父（而非 context.Background()），
 	// 并叠加按配置的超时。取消控制指令或 asynq 取消都会中断进行中的 LLM 调用。
+	//
+	// 注意：必须在【装载/压缩之前】创建。压缩会发起额外的 LLM 调用，
+	// 若在超时 ctx 之外执行，既不受超时约束、也不受取消指令影响。
 	timeout := 2 * time.Minute
 	if s := config.AppConfig.LLM.TimeoutSeconds; s > 0 {
 		timeout = time.Duration(s) * time.Second
@@ -877,6 +1171,18 @@ func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) err
 	defer cancel()
 	p.registerInFlight(t.ID, cancel)
 	defer p.unregisterInFlight(t.ID)
+
+	var historyMessages []openai.ChatCompletionMessage
+	conversationID := t.ConversationID
+	if conversationID == "" {
+		conversationID = t.SessionID // 兼容旧数据：无 ConversationID 时回退 SessionID
+	}
+	if conversationID != "" {
+		// 按 token 预算装载会话历史；装不下的较早轮次会被【由旧向新】分批压缩为滚动摘要。
+		// 压缩使用与主生成相同的 Agent 凭证，避免对话内容外发到该 Agent 未配置的厂商。
+		historyMessages = p.loadConversationHistory(apiCtx, conversationID, systemPrompt, t.Payload,
+			AgentCredential{APIKey: agentAPIKey, BaseURL: agentBaseURL, Model: agentModel}, tools, budget)
+	}
 
 	observer := func(obs llm.ToolCallObservation) {
 		ev := &model.ToolCallEvent{
@@ -917,6 +1223,22 @@ func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) err
 		log.Printf("[Worker] Task %s was cancelled during API call, aborting", t.ID)
 		p.saveRunLog(&t, model.StatusCancelled, "", budget, start, "cancelled during API call")
 		return nil
+	}
+
+	// 上下文溢出：以相同输入重试必然再次溢出（装载是确定性的），
+	// 因此必须【收紧预算 + 去掉保底轮次】重新装载后再试一次；仍失败则明确降级、不再重试。
+	if err != nil && errors.Is(err, llm.ErrContextOverflow) && conversationID != "" {
+		log.Printf("[Worker][WARN] task %s context overflow, retrying with tightened context", t.ID)
+		tight := loadBudgetTokens(systemPrompt, t.Payload, "", tools, config.AppConfig.LLM, config.AppConfig.Compress)
+		tight = tight * 7 / 10
+		tightTurns := p.manager.GetConversationHistory(conversationID, 50)
+		tightLoaded, _ := greedyLoad(tightTurns, tight, 0)
+		historyMessages = buildHistory("", tightLoaded)
+		result, err = p.llmClient.GenerateWithToolsAndObserver(apiCtx, agentAPIKey, agentBaseURL, agentModel,
+			systemPrompt, historyMessages, t.Payload, tools, observer, budget)
+		if err != nil {
+			log.Printf("[Worker][ALERT] task %s context overflow persists after tightening: %v", t.ID, err)
+		}
 	}
 
 	if err != nil {
@@ -980,6 +1302,10 @@ func (p *Pool) saveRunLog(t *model.Task, status model.TaskStatus, result string,
 	metrics.LLMTokens.WithLabelValues("task:process", "in").Add(float64(budget.TokensIn))
 	metrics.LLMTokens.WithLabelValues("task:process", "out").Add(float64(budget.TokensOut))
 	metrics.LLMCost.WithLabelValues("task:process").Add(budget.CostUSD())
+	// 缓存命中 token：用于观测 prompt 缓存的收益，并与 CostUSD 的分档计价交叉验证。
+	if cached := budget.TotalTokensCached(); cached > 0 {
+		metrics.LLMCachedTokens.WithLabelValues("task:process").Add(float64(cached))
+	}
 
 	modelName := config.AppConfig.LLM.Model
 	if t.AgentID != "" {

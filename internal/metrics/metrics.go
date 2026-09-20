@@ -59,17 +59,69 @@ var (
 		Help: "知识库文档构建数量（按状态）",
 	}, []string{"status"})
 
-	// CompressTotal 记录上下文压缩尝试次数（用于计算压缩失败率）。
+	// CompressTotal 记录上下文压缩【批次】尝试次数。
+	// 粒度说明：一次分批压缩中的每一批各计一次（与压缩调用一一对应），
+	// 因此 CompressFailed / CompressTotal 即批次级失败率。
 	CompressTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "gotaskai_context_compress_total",
-		Help: "上下文压缩尝试次数",
+		Help: "上下文压缩批次尝试次数",
 	})
 
-	// CompressFailed 记录上下文压缩失败次数（CompressFailed / CompressTotal 即失败率）。
+	// CompressFailed 记录上下文压缩批次失败次数（CompressFailed / CompressTotal 即失败率）。
 	CompressFailed = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "gotaskai_context_compress_failed_total",
-		Help: "上下文压缩失败次数",
+		Help: "上下文压缩批次失败次数",
 	})
+
+	// ContextTotalTurns 记录每次上下文装载时「游标之后的历史总轮数」（SQL COUNT 结果）。
+	// 它与 ContextLoadedTurns 的差值即"真实溢出"轮数，是判断压缩是否在推进的关键依据。
+	ContextTotalTurns = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gotaskai_context_total_turns",
+		Help:    "游标之后的历史总轮数（每次上下文装载）",
+		Buckets: []float64{1, 5, 10, 20, 50, 100, 500, 1000, 5000},
+	})
+
+	// ContextLoadedTurns 记录每次实际装载进 prompt 的历史轮数。
+	ContextLoadedTurns = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gotaskai_context_loaded_turns",
+		Help:    "实际装载进 prompt 的历史轮数",
+		Buckets: []float64{1, 5, 10, 20, 50, 100, 500, 1000},
+	})
+
+	// ContextUnloadedTurns 记录每次装载后「未装载（真实溢出）」的轮数。
+	// 该值长期不下降意味着压缩没有推进（回归告警依据）。
+	ContextUnloadedTurns = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gotaskai_context_unloaded_turns",
+		Help:    "未装载（溢出）的历史轮数",
+		Buckets: []float64{1, 5, 10, 20, 50, 100, 500, 1000, 5000},
+	})
+
+	// ContextBudgetUsedRatio 记录装载预算的使用率（已用 token / 装载预算）。
+	ContextBudgetUsedRatio = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gotaskai_context_budget_used_ratio",
+		Help:    "历史装载预算使用率",
+		Buckets: []float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0},
+	})
+
+	// CompressRoundsPerRequest 记录单次上下文装载触发的压缩批数（观察是否长期触顶 max_compress_rounds）。
+	CompressRoundsPerRequest = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gotaskai_context_compress_rounds_per_request",
+		Help:    "单次上下文装载触发的压缩批数",
+		Buckets: []float64{1, 2, 3, 5, 8, 10, 20},
+	})
+
+	// SummaryCompressIneffective 记录摘要二次精简"未变短"的次数（用于确认收敛判据生效）。
+	SummaryCompressIneffective = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gotaskai_context_summary_compress_ineffective_total",
+		Help: "摘要二次精简未产生更短结果的次数",
+	})
+
+	// LLMCachedTokens 记录命中 prompt 缓存的输入 token 数（按队列）。
+	// 用于量化缓存收益，并使成本折算能区分缓存命中/未命中单价。
+	LLMCachedTokens = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gotaskai_llm_cached_tokens_total",
+		Help: "命中 prompt 缓存的输入 token 数（按队列）",
+	}, []string{"queue"})
 
 	// IntentDecisions 记录意图路由决策次数，按决策来源（rule/semantic/llm/fallback 等）分桶。
 	// 各层命中率可直接由 source 分布计算。

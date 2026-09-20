@@ -338,6 +338,45 @@ func (m *TaskManager) GetConversationHistorySince(conversationID string, after *
 	return tasks
 }
 
+// CountConversationHistorySince 统计游标之后的历史完成任务【总轮数】（不受 LIMIT 影响）。
+//
+// 这是"真实溢出"的度量基础：装载查询本身带 LIMIT，看不到窗口之外的部分；
+// 只有拿到全量计数，调用方才能发现"还有多少轮没有被装载、因而需要被压缩"。
+func (m *TaskManager) CountConversationHistorySince(conversationID string, after *time.Time) int64 {
+	if conversationID == "" {
+		return 0
+	}
+	query := m.db.Model(&model.Task{}).
+		Where("(conversation_id = ? OR id = ?) AND status = ?", conversationID, conversationID, model.StatusCompleted)
+	if after != nil && !after.IsZero() {
+		query = query.Where("created_at > ?", *after)
+	}
+	var n int64
+	if err := query.Count(&n).Error; err != nil {
+		slog.Error("count conversation history failed", "conversation_id", conversationID, "error", err)
+		return 0
+	}
+	return n
+}
+
+// GetOldestConversationBatch 取游标之后【最旧】的一批历史完成任务（升序）。
+//
+// 与 GetConversationHistorySince（倒序取最新 N 条）方向相反，专供压缩使用：
+// 压缩必须沿时间轴【由旧向新】推进游标，否则"装载窗口之外"的更早轮次永远不会被覆盖。
+func (m *TaskManager) GetOldestConversationBatch(conversationID string, after *time.Time, limit int) []*model.Task {
+	var tasks []*model.Task
+	if conversationID == "" || limit <= 0 {
+		return tasks
+	}
+	query := m.db.Where("(conversation_id = ? OR id = ?) AND status = ?",
+		conversationID, conversationID, model.StatusCompleted)
+	if after != nil && !after.IsZero() {
+		query = query.Where("created_at > ?", *after)
+	}
+	query.Order("created_at asc").Limit(limit).Find(&tasks)
+	return tasks
+}
+
 // GetAllTasks 获取当前系统中的所有任务列表（已废弃，改为按用户获取）
 // GetTasksByUserID 获取当前登录用户的所有任务列表
 func (m *TaskManager) GetTasksByUserID(userID uint) []*model.Task {
@@ -740,19 +779,29 @@ func (m *TaskManager) GetConversationCompressState(id string) (summary string, c
 	return c.Summary, c.SummaryCutoff
 }
 
-// SaveConversationSummary 保存会话的滚动摘要（上下文压缩时调用）。
-func (m *TaskManager) SaveConversationSummary(id string, summary string, cutoff *time.Time) error {
+// SaveConversationSummaryCAS 以 CAS（compare-and-swap）语义保存会话摘要与压缩游标：
+// 仅当新游标【严格前进】时才写入，返回 true 表示本次写入生效。
+//
+// 为什么要 CAS：同一会话可能被并发处理（Asynq 多协程），而"读游标 → 压缩 → 写回"是典型的
+// 读改写。若无条件 Updates，后写者会覆盖先写者的摘要，且游标可能【倒退】，
+// 导致已压缩轮次被重复压缩、进度丢失。写入失败时调用方应丢弃本次摘要（下次请求会自然收敛）。
+func (m *TaskManager) SaveConversationSummaryCAS(id string, summary string, cutoff time.Time) bool {
 	if id == "" {
-		return nil
+		return false
 	}
-	updates := map[string]any{
-		"summary":    summary,
-		"updated_at": time.Now(),
+	res := m.db.Model(&model.Conversation{}).
+		Where("id = ? AND (summary_cutoff IS NULL OR summary_cutoff < ?)", id, cutoff).
+		Updates(map[string]any{
+			"summary":        summary,
+			"summary_cutoff": cutoff,
+			"updated_at":     time.Now(),
+		})
+	if res.Error != nil {
+		slog.Error("save conversation summary failed", "conversation_id", id, "error", res.Error)
+		return false
 	}
-	if cutoff != nil {
-		updates["summary_cutoff"] = *cutoff
-	}
-	return m.db.Model(&model.Conversation{}).Where("id = ?", id).Updates(updates).Error
+	// GORM 在影响 0 行时不会报错，必须用 RowsAffected 判定是否真正写入。
+	return res.RowsAffected == 1
 }
 
 // ListConversations 获取当前用户的全部会话（按最近更新倒序）。

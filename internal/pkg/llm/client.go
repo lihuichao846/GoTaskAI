@@ -203,6 +203,20 @@ func (c *Client) generateWithClient(ctx context.Context, client *openai.Client, 
 			req.Tools = openaiTools
 		}
 
+		// 上下文溢出校验：必须在【每次】请求前执行（含工具循环内的后续请求），
+		// 且要计入工具 schema、按当前 messages 估算——循环中消息会不断被追加。
+		// 缺了这道校验，输入可能撑满窗口导致供应商报错或输出被截断。
+		if window := config.AppConfig.LLM.ContextWindow; window > 0 {
+			if maxOut := config.AppConfig.LLM.MaxOutputTokens; maxOut > 0 {
+				req.MaxTokens = maxOut
+			}
+			inTok := EstimateMessagesTokensRaw(messages) + EstimateToolsTokens(tools)
+			if inTok+req.MaxTokens > window {
+				return "", fmt.Errorf("%w: estimated input %d + max_tokens %d > window %d",
+					ErrContextOverflow, inTok, req.MaxTokens, window)
+			}
+		}
+
 		resp, err := client.CreateChatCompletion(ctx, req)
 		if err != nil {
 			return "", fmt.Errorf("AI API call failed: %w", err)
@@ -211,7 +225,13 @@ func (c *Client) generateWithClient(ctx context.Context, client *openai.Client, 
 			return "", fmt.Errorf("AI returned empty response")
 		}
 
-		budget.Record(resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+		// 计量：若供应商返回了缓存命中明细，则一并记录，使成本能按「命中 / 未命中」分档折算；
+		// 字段缺失时 cached = 0，等价于全部按未命中单价计价（与改造前行为一致）。
+		cached := 0
+		if d := resp.Usage.PromptTokensDetails; d != nil && d.CachedTokens > 0 {
+			cached = d.CachedTokens
+		}
+		budget.RecordWithCache(resp.Usage.PromptTokens, resp.Usage.CompletionTokens, cached)
 
 		msg := resp.Choices[0].Message
 
@@ -377,28 +397,96 @@ func isCJK(r rune) bool {
 		unicode.Is(unicode.Hangul, r)
 }
 
+const (
+	// messageOverheadTokens 为每条消息的固定附加开销（role / 分隔符等在真实 tokenizer 下的近似值）。
+	messageOverheadTokens = 4
+	// toolMessageExtraTokens 为工具消息的额外开销（工具名与调用标记）。
+	toolMessageExtraTokens = 8
+)
+
 // EstimateMessagesTokens 估算「system 提示 + 历史轮次 + 当前用户输入」的整体 token 数。
 // 每条消息额外附加少量 token 用于角色标识（role/system 标记等）。
 func EstimateMessagesTokens(systemPrompt string, history []openai.ChatCompletionMessage, userPrompt string) int {
-	total := EstimateTokens(systemPrompt) + 4
+	total := EstimateTokens(systemPrompt) + messageOverheadTokens
 	for _, m := range history {
-		total += EstimateTokens(m.Content) + 4
+		total += EstimateTokens(m.Content) + messageOverheadTokens
 		if m.Role == openai.ChatMessageRoleTool {
-			total += EstimateTokens(m.Name) + 8 // 工具名与调用开销略大
+			total += EstimateTokens(m.Name) + toolMessageExtraTokens // 工具名与调用开销略大
 		}
 	}
-	total += EstimateTokens(userPrompt) + 4
+	total += EstimateTokens(userPrompt) + messageOverheadTokens
 	return total
 }
 
-// CompressHistory 将较早的对话轮次压缩为一段摘要（用于上下文自动压缩）。
-// summaryBase 为已有的滚动摘要（可为空）；turns 为待压缩的历史轮次。
-// 返回合并压缩后的新摘要文本。model 为空时回退到默认模型。
-func (c *Client) CompressHistory(ctx context.Context, model string, summaryBase string, turns []openai.ChatCompletionMessage) (string, error) {
-	if model == "" {
-		model = c.model
+// EstimateMessagesTokensRaw 估算一组【已组装】消息的整体 token 数。
+// 用于工具循环内的溢出校验：循环过程中消息会被不断追加（assistant / tool），
+// 必须按当前 messages 重新估算，而非沿用首次请求的估算值。
+func EstimateMessagesTokensRaw(messages []openai.ChatCompletionMessage) int {
+	total := 0
+	for _, m := range messages {
+		total += EstimateTokens(m.Content) + messageOverheadTokens
+		if m.Role == openai.ChatMessageRoleTool {
+			total += EstimateTokens(m.Name) + toolMessageExtraTokens
+		}
 	}
+	return total
+}
 
+// EstimateToolsTokens 估算工具定义（JSON Schema）占用的输入 token。
+// 工具 schema 会被供应商计入输入，但 EstimateMessagesTokens 不覆盖它，
+// 因此装载预算与溢出校验都必须单独加上本项，否则会低估实际输入。
+func EstimateToolsTokens(tools []toolregistry.Tool) int {
+	if len(tools) == 0 {
+		return 0
+	}
+	total := 0
+	for _, t := range tools {
+		b, err := json.Marshal(t.ToOpenAITool())
+		if err != nil {
+			continue
+		}
+		total += EstimateTokens(string(b)) + 10
+	}
+	return total
+}
+
+// CompressPromptOverheadTokens 为压缩提示词模板自身的固定 token 开销估算（指令与格式标记）。
+// 调用方计算"单批压缩可用输入"时必须扣除它，否则实际输入会超过配置上限。
+const CompressPromptOverheadTokens = 256
+
+// TruncateToTokens 按估算 token 数截断文本（口径与 EstimateTokens 一致：
+// CJK 每字约 1 token，其余字符每 4 个约 1 token）。用于把超长内容压到指定预算内。
+func TruncateToTokens(text string, maxTokens int) string {
+	if maxTokens <= 0 {
+		return ""
+	}
+	if EstimateTokens(text) <= maxTokens {
+		return text
+	}
+	used := 0.0
+	var b strings.Builder
+	for _, r := range text {
+		weight := 0.25
+		if isCJK(r) {
+			weight = 1
+		}
+		if used+weight > float64(maxTokens) {
+			break
+		}
+		b.WriteRune(r)
+		used += weight
+	}
+	return b.String()
+}
+
+// ErrContextOverflow 表示「估算输入 + 预留输出」已超出模型上下文窗口。
+// 调用方应压缩上下文后【收紧预算】重试；不应以相同输入重试（装载是确定性的，必然再次溢出）。
+var ErrContextOverflow = fmt.Errorf("context overflow: estimated input plus reserved output exceeds model window")
+
+// buildCompressPrompt 构建「合并式」压缩提示词：把已有摘要作为基底，与本次待压缩轮次一同提交，
+// 让 LLM 产出【更新后的新摘要】而非重新总结全部历史。
+// 这是滚动摘要成本为 O(新增轮次) 而非 O(全部轮次) 的关键。
+func buildCompressPrompt(summaryBase string, turns []openai.ChatCompletionMessage) string {
 	var b strings.Builder
 	b.WriteString("你是对话历史压缩助手。请把下面的对话内容浓缩成一段简洁、信息完整的摘要；")
 	b.WriteString("必须保留：用户的核心目标与诉求、已确认的事实与结论、已完成的关键步骤、以及重要的数字/名称/日期。")
@@ -419,8 +507,43 @@ func (c *Client) CompressHistory(ctx context.Context, model string, summaryBase 
 		}
 	}
 	b.WriteString("\n请只输出更新后的摘要正文，不要任何解释、前缀或 markdown 代码块。")
+	return b.String()
+}
 
-	return c.generate(ctx, model, "", nil, b.String(), nil, nil)
+// CompressHistory 将较早的对话轮次压缩为一段摘要（使用全局默认模型与凭证）。
+// summaryBase 为已有的滚动摘要（可为空）；turns 为待压缩的历史轮次。
+// 返回合并压缩后的新摘要文本。model 为空时回退到默认模型。
+func (c *Client) CompressHistory(ctx context.Context, model string, summaryBase string, turns []openai.ChatCompletionMessage) (string, error) {
+	if model == "" {
+		model = c.model
+	}
+	return c.generate(ctx, model, "", nil, buildCompressPrompt(summaryBase, turns), nil, nil)
+}
+
+// CompressHistoryAs 与 CompressHistory 相同，但使用指定的 apiKey / baseURL / model
+// （为空时按 GenerateWithToolsAndObserver 的同一规则回退到全局默认）。
+//
+// 动机（合规）：Agent 可以配置私有模型与厂商。若压缩固定走全局默认厂商，
+// 该 Agent 的对话内容会因「压缩」这一内部动作而外发到本不该去的厂商，且从配置上看不出来。
+//
+// budget 为压缩调用使用的【独立】预算：它限制压缩自身的调用次数（避免超长会话反复压缩），
+// 不占用主任务的 max_calls_per_task 配额；其 token 计量由调用方通过 Budget.AddUsage 并入主账本。
+func (c *Client) CompressHistoryAs(ctx context.Context, apiKey, baseURL, model string, summaryBase string,
+	turns []openai.ChatCompletionMessage, budget *Budget) (string, error) {
+	client := c.client
+	if apiKey != "" || baseURL != "" {
+		cfg := openai.DefaultConfig(apiKey)
+		if baseURL != "" {
+			cfg.BaseURL = baseURL
+		} else {
+			cfg.BaseURL = c.baseURL
+		}
+		client = openai.NewClientWithConfig(cfg)
+	}
+	if model == "" {
+		model = c.model
+	}
+	return c.generateWithClient(ctx, client, model, "", nil, buildCompressPrompt(summaryBase, turns), nil, nil, budget, nil)
 }
 
 // SummarizeText 将一段文档内容压缩为简洁摘要（用于知识库文档的构建期摘要层）。

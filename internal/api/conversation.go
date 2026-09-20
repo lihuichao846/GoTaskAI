@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -28,9 +29,15 @@ type CreateConversationRequest struct {
 }
 
 // resolveConversationID 查找或创建会话并返回其 ID，供任务提交时写入 ConversationID。
+//
+// 失败时返回空串（刻意不阻断提交：会话记录创建失败不该让用户无法提问），
+// 但必须留下日志——否则该轮会静默地"没有会话归属"，用户在历史里看不到它，
+// 且排查时无迹可寻。
 func resolveConversationID(manager *queue.TaskManager, userID uint, agentID, sessionID string) string {
 	conv, err := manager.GetOrCreateConversation(userID, agentID, sessionID)
 	if err != nil {
+		log.Printf("[API][WARN] resolveConversationID failed (user=%d agent=%s session=%s): %v",
+			userID, agentID, sessionID, err)
 		return ""
 	}
 	return conv.ID

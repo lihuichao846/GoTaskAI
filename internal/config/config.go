@@ -114,21 +114,44 @@ type LLMConfig struct {
 	MaxCallsPerTask int `mapstructure:"max_calls_per_task"`
 	// MaxTotalCallsPerTask 为单个任务跨重试累计允许的最大模型调用次数，<=0 时由 worker 兜底为默认值。
 	MaxTotalCallsPerTask int `mapstructure:"max_total_calls_per_task"`
-	// CostPer1MIn / CostPer1MOut 为模型输入/输出单价（美元 / 百万 token），用于 CostUSD 折算，未配置为 0。
-	CostPer1MIn  float64 `mapstructure:"cost_per_1m_in"`
-	CostPer1MOut float64 `mapstructure:"cost_per_1m_out"`
-	// ContextWindow 为当前对话模型支持的上下文窗口（token 数），用于判断何时触发上下文压缩。
+	// CostPer1MIn / CostPer1MInCached / CostPer1MOut 为模型输入（未命中缓存）/ 输入（命中缓存）/ 输出
+	// 单价（美元 / 百万 token），用于 CostUSD 折算，未配置为 0。
+	// CostPer1MInCached 未配置（为 0）时按 CostPer1MIn 计价，即不区分缓存命中。
+	CostPer1MIn       float64 `mapstructure:"cost_per_1m_in"`
+	CostPer1MInCached float64 `mapstructure:"cost_per_1m_in_cached"`
+	CostPer1MOut      float64 `mapstructure:"cost_per_1m_out"`
+	// ContextWindow 为当前对话模型支持的上下文窗口（token 数），用于上下文装载预算与溢出校验。
 	ContextWindow int `mapstructure:"context_window"`
-	// CompressThreshold 为触发压缩的占用比例（如 0.7 表示上下文达到窗口 70% 时压缩）。
-	CompressThreshold float64 `mapstructure:"compress_threshold"`
+	// OutputReserve 为每次请求为模型输出预留的 token 数（从装载预算中扣除），<=0 时不预留。
+	OutputReserve int `mapstructure:"output_reserve"`
+	// MaxOutputTokens 为请求中显式设置的 max_tokens；<=0 时不设置（沿用供应商默认值）。
+	MaxOutputTokens int `mapstructure:"max_output_tokens"`
 }
 
 // CompressConfig 为对话上下文自动压缩（摘要）提供配置。
+//
+// 语义说明（v1.1 起）：历史装载由 token 预算驱动，MaxLoadTurns 仅作安全上限；
+// 压缩的触发条件是"有历史装不下"（真实溢出），而非"上下文占用超过窗口比例"。
 type CompressConfig struct {
-	Enabled    bool `mapstructure:"enabled"`
-	MaxHistory int  `mapstructure:"max_history"` // 单次任务最多加载的历史轮数
-	KeepRecent int  `mapstructure:"keep_recent"` // 压缩时保留下来的最近原始消息轮数
-	MinTurns   int  `mapstructure:"min_turns"`   // 历史轮数少于该值时不做压缩
+	Enabled bool `mapstructure:"enabled"`
+	// MaxLoadTurns 为单次任务装载历史的安全上限（实际装载量由 token 预算决定，本值仅防极端）。
+	// 旧配置项 max_history 已废弃（语义不同，不再读取）。
+	MaxLoadTurns int `mapstructure:"max_load_turns"`
+	// KeepRecent 为压缩时保留下来的最近原始轮数，同时作为装载的最低保障轮数。
+	KeepRecent int `mapstructure:"keep_recent"`
+	// MinTurns 为触发压缩所需的最小溢出轮数（溢出少于该值时可容忍不压）。
+	MinTurns int `mapstructure:"min_turns"`
+	// BudgetRatio 为装载预算占上下文窗口的比例（如 0.6 表示用 60% 窗口装载历史）。
+	BudgetRatio float64 `mapstructure:"budget_ratio"`
+	// MaxCompressInputTokens 为单批压缩请求的输入 token 上限（含已有摘要与提示词模板开销）。
+	MaxCompressInputTokens int `mapstructure:"max_compress_input_tokens"`
+	// MaxCompressTurns 为单批压缩的轮数上限。
+	MaxCompressTurns int `mapstructure:"max_compress_turns"`
+	// MaxCompressRounds 为单次任务运行内最多执行的压缩批数（限制单次收敛速度，防超长会话拖垮请求）。
+	// 一批 = 一次 LLM 调用，因此本项已同时约束单次运行的压缩调用次数。
+	MaxCompressRounds int `mapstructure:"max_compress_rounds"`
+	// MaxSummaryTokens 为滚动摘要的长度上限（超出时触发一次精简），<=0 时不限制。
+	MaxSummaryTokens int `mapstructure:"max_summary_tokens"`
 }
 
 // RerankConfig 为召回重排（rerank）提供配置，默认指向阿里云百炼 DashScope 的 qwen3-rerank 云端接口。
