@@ -23,6 +23,7 @@ type Config struct {
 	Compress CompressConfig `mapstructure:"compress"`
 	Context  ContextConfig  `mapstructure:"context"`
 	Intent   IntentConfig   `mapstructure:"intent"`
+	Memory   MemoryConfig   `mapstructure:"memory"`
 	Metrics  MetricsConfig  `mapstructure:"metrics"`
 	Milvus   MilvusConfig   `mapstructure:"milvus"`
 }
@@ -121,7 +122,16 @@ type LLMConfig struct {
 	CostPer1MInCached float64 `mapstructure:"cost_per_1m_in_cached"`
 	CostPer1MOut      float64 `mapstructure:"cost_per_1m_out"`
 	// ContextWindow 为当前对话模型支持的上下文窗口（token 数），用于上下文装载预算与溢出校验。
+	// 必须是【真实值】：配小了会让溢出校验误判、压缩触发过早；配大了会放过真正超窗的请求。
 	ContextWindow int `mapstructure:"context_window"`
+	// ThinkingMode 控制【主对话】的思考模式："enabled" / "disabled"；留空按 "enabled" 处理。
+	// 背景：deepseek-v4-pro 默认开启思考，思维链与正式回答共享输出预算。
+	// 实测同一问题：开启时输出 4943 token（其中 4653 为 reasoning、正式回答 1106 字符）；
+	// 关闭后输出 605 token（无 reasoning、正式回答 2284 字符）——省约 88% 输出成本且回答更完整。
+	ThinkingMode string `mapstructure:"thinking_mode"`
+	// ThinkingAuxMode 控制【辅助调用】（压缩摘要、相关性判定、意图分类）的思考模式；
+	// 留空按 "disabled" 处理。这些调用只需简短输出，开启思考纯属浪费。
+	ThinkingAuxMode string `mapstructure:"thinking_aux_mode"`
 	// OutputReserve 为每次请求为模型输出预留的 token 数（从装载预算中扣除），<=0 时不预留。
 	OutputReserve int `mapstructure:"output_reserve"`
 	// MaxOutputTokens 为请求中显式设置的 max_tokens；<=0 时不设置（沿用供应商默认值）。
@@ -143,6 +153,12 @@ type CompressConfig struct {
 	MinTurns int `mapstructure:"min_turns"`
 	// BudgetRatio 为装载预算占上下文窗口的比例（如 0.6 表示用 60% 窗口装载历史）。
 	BudgetRatio float64 `mapstructure:"budget_ratio"`
+	// MaxLoadTokens 为装载预算的【绝对上限】（成本与质量护栏），<=0 时仅由 BudgetRatio 决定。
+	//
+	// 为什么需要它：真实窗口可能远大于"该用多少"。例如 deepseek-v4-pro 窗口为 1,000,000，
+	// 若纯按比例装载（1M × 0.6）就是 60 万 token——即便单价低廉（缓存命中 0.025 元/百万），
+	// 未命中时也要 1.8 元/次，且超长上下文会带来质量下降（context rot）与更高延迟。
+	MaxLoadTokens int `mapstructure:"max_load_tokens"`
 	// MaxCompressInputTokens 为单批压缩请求的输入 token 上限（含已有摘要与提示词模板开销）。
 	MaxCompressInputTokens int `mapstructure:"max_compress_input_tokens"`
 	// MaxCompressTurns 为单批压缩的轮数上限。
@@ -210,6 +226,35 @@ type IntentConfig struct {
 	RouteTimeoutSeconds int `mapstructure:"route_timeout_seconds"`
 	// EnableToolRouting 开启时 LLM 使用四分类提示词并据此裁剪工具（默认 false，暂不裁剪）。
 	EnableToolRouting bool `mapstructure:"enable_tool_routing"`
+}
+
+// MemoryConfig 控制【用户向】长期记忆（跨会话）：把用户说过的事实与偏好持久化，
+// 并在后续会话中按需召回注入。
+//
+// 与 RAG/KAG 的分工：RAG/KAG 召回的是"关于世界的文档知识"，本模块召回的是"关于用户自身的状态"。
+// 与 compress 的分工：compress 解决"单个会话内不丢信息"，本模块解决"换了会话还记得"。
+type MemoryConfig struct {
+	// Enabled 为召回总开关；false 时行为与改造前完全一致（不读库、不注入）。
+	Enabled bool `mapstructure:"enabled"`
+	// WriteEnabled 为写入开关（可先只读召回、暂不开写入）。注意：它不约束删除——
+	// 用户的删除权不能被运维开关挡住。
+	WriteEnabled bool `mapstructure:"write_enabled"`
+
+	// MaxRecallItems 为单次召回注入的条数上限。
+	MaxRecallItems int `mapstructure:"max_recall_items"`
+	// MaxRecallTokens 为"召回块"的 token 上限（从装载预算中扣除）。
+	// 必须独立于知识上下文的字符上限，否则记忆会挤压历史装载预算。
+	MaxRecallTokens int `mapstructure:"max_recall_tokens"`
+	// MaxProfileTokens 为"常驻偏好块"的 token 上限（拼进 system prompt，对同一用户基本不变）。
+	MaxProfileTokens int `mapstructure:"max_profile_tokens"`
+
+	// MaxContentChars 为单条记忆的字符数上限（写入闸门），与列宽 varchar(1024) 同源。
+	MaxContentChars int `mapstructure:"max_content_chars"`
+	// PerUserLimit 为每用户记忆条数上限（召回与写入的容量护栏）。
+	PerUserLimit int `mapstructure:"per_user_limit"`
+	// EpisodicTTLDays 为 episodic（经历类）记忆的有效天数；<=0 表示不过期。
+	// semantic / preference 不受其约束——偏好与事实的失效应由"新事实取代"来驱动，而非时间。
+	EpisodicTTLDays int `mapstructure:"episodic_ttl_days"`
 }
 
 var AppConfig Config

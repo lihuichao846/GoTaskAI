@@ -43,7 +43,7 @@ func main() {
 		sqlDB.SetMaxOpenConns(cfg.MySQL.MaxOpenConns)
 	}
 
-	if err := mysqlDB.AutoMigrate(&model.Task{}, &model.User{}, &model.Agent{}, &model.Tool{}, &model.KnowledgeBase{}, &model.AgentTool{}, &model.AgentKnowledge{}, &model.Document{}, &model.Conversation{}, &model.RunLog{}, &model.ToolCallLog{}); err != nil {
+	if err := mysqlDB.AutoMigrate(&model.Task{}, &model.User{}, &model.Agent{}, &model.Tool{}, &model.KnowledgeBase{}, &model.AgentTool{}, &model.AgentKnowledge{}, &model.Document{}, &model.Conversation{}, &model.RunLog{}, &model.ToolCallLog{}, &model.UserMemory{}); err != nil {
 		slog.Error("Failed to auto migrate database", "error", err)
 		os.Exit(1)
 	}
@@ -107,6 +107,7 @@ func main() {
 	toolHandler := api.NewToolHandler(manager, llm.NewClient())
 	knowledgeBaseHandler := api.NewKnowledgeBaseHandler(manager)
 	conversationHandler := api.NewConversationHandler(manager)
+	memoryHandler := api.NewMemoryHandler(manager)
 
 	if cfg.Server.Mode == "release" {
 		gin.SetMode(gin.ReleaseMode)
@@ -206,6 +207,17 @@ func main() {
 			knowledgeGroup.DELETE("/:id", knowledgeBaseHandler.DeleteKnowledgeBase)
 			knowledgeGroup.POST("/:id/documents", knowledgeBaseHandler.AddDocument)
 			knowledgeGroup.DELETE("/:id/documents/:docId", knowledgeBaseHandler.DeleteDocument)
+		}
+
+		// 用户向长期记忆：写入受 memory.write_enabled 约束，删除始终允许（用户删除权）。
+		memoriesGroup := apiGroup.Group("/memories")
+		memoriesGroup.Use(middleware.AuthMiddleware())
+		{
+			memoriesGroup.POST("", memoryHandler.CreateMemory)
+			memoriesGroup.GET("", memoryHandler.ListMemories)
+			memoriesGroup.PUT("/:id", memoryHandler.UpdateMemory)
+			memoriesGroup.DELETE("/:id", memoryHandler.DeleteMemory)
+			memoriesGroup.DELETE("", memoryHandler.DeleteAllMemories)
 		}
 
 		apiGroup.GET("/tasks/stream", handler.StreamTasks)

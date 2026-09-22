@@ -708,17 +708,28 @@ func buildHistory(summaryText string, recent []*model.Task) []openai.ChatComplet
 //
 // 漏掉任一项，"预算内"就不等于"窗口内"。
 func loadBudgetTokens(systemPrompt, userPrompt, summary string, tools []toolregistry.Tool,
-	lc config.LLMConfig, cc config.CompressConfig) int {
+	memoryTokens int, lc config.LLMConfig, cc config.CompressConfig) int {
 
 	ratio := cc.BudgetRatio
 	if ratio <= 0 || ratio >= 1 {
 		ratio = 0.6
 	}
 	budget := int(float64(lc.ContextWindow) * ratio)
+
+	// 绝对上限：真实窗口可能远大于"该用多少"。例如 deepseek-v4-pro 窗口为 1,000,000，
+	// 纯按比例装载就是 60 万 token——未命中缓存时约 1.8 元/次，且超长上下文有质量退化风险。
+	// MaxLoadTokens 是成本与质量护栏，避免装载量随窗口放大而失控。
+	if cc.MaxLoadTokens > 0 && budget > cc.MaxLoadTokens {
+		budget = cc.MaxLoadTokens
+	}
+
 	budget -= llm.EstimateTokens(systemPrompt)
 	budget -= llm.EstimateTokens(userPrompt)
 	budget -= llm.EstimateTokens(summary)
 	budget -= llm.EstimateToolsTokens(tools)
+	// 长期记忆的召回块同样占用输入，必须扣除——否则"预算内"就不再等于"上下文内"，
+	// 历史装载会被记忆挤掉（systemPrompt 中已包含偏好块，故此处只需再扣召回块）。
+	budget -= memoryTokens
 	if lc.OutputReserve > 0 {
 		budget -= lc.OutputReserve
 	}
@@ -946,7 +957,8 @@ func (p *Pool) compressForward(ctx context.Context, conversationID string, cred 
 // 返回给 LLM 的消息切片：最前是一条「此前对话摘要」system 消息（若已存在摘要），
 // 其后为按时间升序排列的原始轮次。
 func (p *Pool) loadConversationHistory(ctx context.Context, conversationID string, systemPrompt string,
-	userPrompt string, cred AgentCredential, tools []toolregistry.Tool, budget *llm.Budget) []openai.ChatCompletionMessage {
+	userPrompt string, cred AgentCredential, tools []toolregistry.Tool, memoryTokens int,
+	budget *llm.Budget) []openai.ChatCompletionMessage {
 
 	cc := config.AppConfig.Compress
 	lc := config.AppConfig.LLM
@@ -977,7 +989,7 @@ func (p *Pool) loadConversationHistory(ctx context.Context, conversationID strin
 	totalRemaining := int(p.manager.CountConversationHistorySince(conversationID, cutoff))
 	recent := p.manager.GetConversationHistorySince(conversationID, cutoff, maxLoadTurns)
 
-	budgetTok := loadBudgetTokens(systemPrompt, userPrompt, summary, tools, lc, cc)
+	budgetTok := loadBudgetTokens(systemPrompt, userPrompt, summary, tools, memoryTokens, lc, cc)
 	loaded, used := greedyLoad(recent, budgetTok, keepRecent)
 	unloaded := totalRemaining - len(loaded)
 
@@ -1006,12 +1018,12 @@ func (p *Pool) loadConversationHistory(ctx context.Context, conversationID strin
 		// CAS 失败：并发的另一轮已把游标推进得更远。丢弃本次摘要，按最新状态重新装载。
 		s2, c2 := p.manager.GetConversationCompressState(conversationID)
 		recent2 := p.manager.GetConversationHistorySince(conversationID, c2, maxLoadTurns)
-		loaded2, _ := greedyLoad(recent2, loadBudgetTokens(systemPrompt, userPrompt, s2, tools, lc, cc), keepRecent)
+		loaded2, _ := greedyLoad(recent2, loadBudgetTokens(systemPrompt, userPrompt, s2, tools, memoryTokens, lc, cc), keepRecent)
 		return buildHistory(s2, loaded2)
 	}
 
 	// 压缩成功：摘要可能变长，需按新摘要重算预算后重新装载。
-	budgetTok2 := loadBudgetTokens(systemPrompt, userPrompt, newSummary, tools, lc, cc)
+	budgetTok2 := loadBudgetTokens(systemPrompt, userPrompt, newSummary, tools, memoryTokens, lc, cc)
 	recent2 := p.manager.GetConversationHistorySince(conversationID, &newCutoff, maxLoadTurns)
 	loaded2, _ := greedyLoad(recent2, budgetTok2, keepRecent)
 
@@ -1158,6 +1170,19 @@ func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) err
 		}
 	}
 
+	// 长期记忆（跨会话）：偏好块进 systemPrompt，召回块稍后插在 history 之后。
+	//
+	// 必须在【装载历史之前】完成：召回块会占用输入 token，其用量要从装载预算中扣除，
+	// 否则记忆会挤压历史装载预算（等于把上下文改造的收益吃掉）。
+	memoryProfile, memoryRecall, memoryHitIDs := p.loadUserMemory(t)
+	memoryTokens := 0
+	if memoryRecall != "" {
+		memoryTokens = llm.EstimateTokens(memoryRecall)
+	}
+	if memoryProfile != "" {
+		systemPrompt += "\n\n" + memoryProfile
+	}
+
 	// 可取消 ctx 派生：以 asynq 传入的 ctx 为父（而非 context.Background()），
 	// 并叠加按配置的超时。取消控制指令或 asynq 取消都会中断进行中的 LLM 调用。
 	//
@@ -1181,8 +1206,20 @@ func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) err
 		// 按 token 预算装载会话历史；装不下的较早轮次会被【由旧向新】分批压缩为滚动摘要。
 		// 压缩使用与主生成相同的 Agent 凭证，避免对话内容外发到该 Agent 未配置的厂商。
 		historyMessages = p.loadConversationHistory(apiCtx, conversationID, systemPrompt, t.Payload,
-			AgentCredential{APIKey: agentAPIKey, BaseURL: agentBaseURL, Model: agentModel}, tools, budget)
+			AgentCredential{APIKey: agentAPIKey, BaseURL: agentBaseURL, Model: agentModel}, tools,
+			memoryTokens, budget)
 	}
+
+	// 召回块插在 history 之后、user 之前：位置靠近当前问题，且不改动 system prompt 前缀
+	// （滚动摘要也是以独立 system 消息的形式注入，此处与之一致）。
+	if memoryRecall != "" {
+		historyMessages = append(historyMessages, openai.ChatCompletionMessage{
+			Role:    openai.ChatMessageRoleSystem,
+			Content: memoryRecall,
+		})
+	}
+	// 命中计数（尽力而为）：只记录"按相关性召回"的记忆，供后续衰减与淘汰使用。
+	p.manager.TouchUserMemories(memoryHitIDs)
 
 	observer := func(obs llm.ToolCallObservation) {
 		ev := &model.ToolCallEvent{
@@ -1229,11 +1266,19 @@ func (p *Pool) handleTaskProcess(ctx context.Context, asynqTask *asynq.Task) err
 	// 因此必须【收紧预算 + 去掉保底轮次】重新装载后再试一次；仍失败则明确降级、不再重试。
 	if err != nil && errors.Is(err, llm.ErrContextOverflow) && conversationID != "" {
 		log.Printf("[Worker][WARN] task %s context overflow, retrying with tightened context", t.ID)
-		tight := loadBudgetTokens(systemPrompt, t.Payload, "", tools, config.AppConfig.LLM, config.AppConfig.Compress)
+		tight := loadBudgetTokens(systemPrompt, t.Payload, "", tools, memoryTokens, config.AppConfig.LLM, config.AppConfig.Compress)
 		tight = tight * 7 / 10
 		tightTurns := p.manager.GetConversationHistory(conversationID, 50)
 		tightLoaded, _ := greedyLoad(tightTurns, tight, 0)
 		historyMessages = buildHistory("", tightLoaded)
+		// 收紧重装后仍需保留召回块：它是与当前问题最相关的一段输入，
+		// 丢掉它会让"重试成功的回答"反而比首次尝试更缺少用户上下文。
+		if memoryRecall != "" {
+			historyMessages = append(historyMessages, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleSystem,
+				Content: memoryRecall,
+			})
+		}
 		result, err = p.llmClient.GenerateWithToolsAndObserver(apiCtx, agentAPIKey, agentBaseURL, agentModel,
 			systemPrompt, historyMessages, t.Payload, tools, observer, budget)
 		if err != nil {

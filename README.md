@@ -134,17 +134,14 @@ GoTaskAI/
 
 ## 📚 学习文档指南 (新手必看)
 
-项目 `docs` 目录下包含了专门为你编写的通俗易懂的原理解析文档，建议结合代码一起阅读：
-*   [Web 框架进化史：net/http vs Gin](./docs/web_framework_guide.md)
-*   [Gin 框架 4 大核心方法速查表](./docs/gin_survival_guide.md)
-*   [GORM 与 Redis 极简入门指南](./docs/db_and_redis_guide.md)
-*   [文件柜与办公桌：为什么我们需要 Redis？](./docs/redis_explanation_guide.md)
-*   [告别轮询：SSE 实时推送原理解析](./docs/sse_vs_polling.md)
-*   [数据库解惑：Navicat、代码与 Docker 卷](./docs/navicat_vs_code_db.md)
-*   [计算机网络底层：I/O 多路复用与 epoll 原理](./docs/io_multiplexing_epoll.md)
-*   [图解网络安全：HTTP vs HTTPS 与握手过程](./docs/http_vs_https_guide.md)
-*   [Go 面试必考：GMP 调度模型与 Channel 原理](./docs/go_gmp_and_channel.md)
-*   [高并发终极方案：Nginx 与 Go 的企业级架构实战](./docs/nginx_architecture_guide.md)
+**首选**：[项目分段精解](./项目分段精解/) —— 按模块拆解的完整实现解析，含背景知识手册、架构图与面试口径。
+
+*   [10-功能模块拆解图谱](./项目分段精解/10-功能模块拆解图谱.md) —— 全景与推荐阅读顺序（从这里开始）
+*   [M0 全局认知与场景总览](./项目分段精解/M0-全局认知与场景总览/01-模块实现解析.md) —— 系统骨架、四个存储、两条消息通道
+*   [X0 背景知识关联手册](./项目分段精解/X0-背景知识关联手册/01-背景知识关联手册.md) —— 背景知识 +「它落在本项目哪个模块」
+*   [docs/ 文档索引](./docs/README.md) —— 仍在使用的方案 / 实现说明 / 面试资料
+
+> 早期的通俗原理笔记（Web 框架、Gin、Redis、epoll、GMP、Nginx、Docker、Git 等 15 篇）已于 **2026-09-20 移入 `docs/_archive_20260920/`**，其内容已被 X0 手册与各模块精解覆盖。
 
 ---
 

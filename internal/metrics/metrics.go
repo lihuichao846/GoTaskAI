@@ -142,4 +142,34 @@ var (
 		Name: "gotaskai_intent_retrieval_skipped_total",
 		Help: "因意图路由跳过 RAG 检索的次数",
 	})
+
+	// MemoryWriteTotal 记录长期记忆的写入结果，按结果分桶。
+	// result=created 正常写入；rejected 被闸门拒绝（类型/长度/配额）；superseded 由新事实取代旧事实。
+	MemoryWriteTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gotaskai_memory_write_total",
+		Help: "长期记忆写入次数（按结果）",
+	}, []string{"result"})
+
+	// MemoryRecallItems 记录单次召回注入的记忆条数。
+	MemoryRecallItems = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gotaskai_memory_recall_items",
+		Help:    "单次召回注入的记忆条数",
+		Buckets: []float64{0, 1, 2, 4, 8, 16, 32},
+	})
+
+	// MemoryRecallTokens 记录单次召回注入占用的 token 数。
+	// 它与 ContextBudgetUsedRatio 一起用于确认"记忆没有挤压历史装载预算"。
+	MemoryRecallTokens = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "gotaskai_memory_recall_tokens",
+		Help:    "单次召回注入的 token 数",
+		Buckets: []float64{0, 50, 100, 200, 400, 800, 1600},
+	})
+
+	// MemoryRecallFailClosed 记录因作用域非法（拿不到 user_id）而【放弃】召回的次数。
+	// 该指标必须恒为 0 或仅有理论值：一旦持续 >0，说明调用链丢了用户身份，
+	// 而记忆的隔离要求是 fail-closed（宁可不注入，也绝不回退到任何"公共"集合）。
+	MemoryRecallFailClosed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gotaskai_memory_recall_fail_closed_total",
+		Help: "因作用域非法（user_id 缺失）放弃召回的记忆次数",
+	})
 )
