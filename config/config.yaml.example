@@ -1,0 +1,170 @@
+server:
+  port: 8080
+  mode: debug
+
+# Prometheus /metrics 端点（Worker 子进程使用 port + childIndex + 1；API 挂在 server.port 上）
+metrics:
+  port: 9100
+
+mysql:
+  dsn: "USER:PASSWORD@tcp(127.0.0.1:3307)/gotaskai?charset=utf8mb4&parseTime=True&loc=Local"
+  max_idle_conns: 10
+  max_open_conns: 100
+
+redis:
+  mode: "standalone" # 本地宿主机开发模式直连映射出的 Redis 端口，避免 Sentinel 返回 Docker 内网地址
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+  master_name: "mymaster"
+  sentinel_addrs:
+    - "127.0.0.1:26379"
+    - "127.0.0.1:26380"
+    - "127.0.0.1:26381"
+
+# Worker 与 API 之间实时事件（任务更新/工具事件）的独立消息通道（NATS）。
+# 目的：把实时事件从 Redis 队列/缓存中解耦出来，避免共用同一 Redis。
+# embedded=true 表示本进程内嵌启动 nats-server，仅 API 进程应设置为 true；Worker 作为客户端连接。
+eventbus:
+  enabled: true
+  url: "nats://0.0.0.0:4222"
+  embedded: true
+
+neo4j:
+  uri: "neo4j://localhost:7687"
+  username: "neo4j"
+  password: "REPLACE_WITH_YOUR_PASSWORD"
+
+queue:
+  capacity: 1000
+  workers: 5
+  processes: 2
+
+# 知识库建库链路配置（W1：图谱抽取入队；W2：定时增量入库）
+kb:
+  graph_enabled: false        # 建库时是否执行图谱抽取阶段（灰度：先关，联调通过后再开启）
+  graph_queue_concurrency: 2  # 图谱阶段并发上限（与向量阶段共用 low 队列，靠信号量限流）
+  # W2 定时增量入库：由 worker 主实例（supervisor）注册 kb:scan 周期任务，单实例投递
+  scan_enabled: false         # 是否注册周期扫描（灰度：先关）
+  scan_cron: "0 3 * * *"      # 扫描周期（标准 5 段 cron，默认每日 03:00）
+  scan_batch_size: 200        # 单次窗口最多入队文档数，防雪崩
+  scan_sources: []            # 扫描源：每个源绑定一个知识库，示例见下
+  #  - kb_id: "替换为知识库ID"
+  #    path: "/data/inbox/papers"
+
+llm:
+  # 对话模型使用 DeepSeek 官方 OpenAI 兼容接口
+  api_key: "REPLACE_WITH_YOUR_DEEPSEEK_API_KEY"
+  base_url: "https://api.deepseek.com/v1"
+  model: "deepseek-v4-pro"
+  # 向量化模型改用阿里百炼 Qwen3-Embedding（text-embedding-v4，1024 维）
+  embedding_model: "text-embedding-v4"
+  embedding_api_key: "REPLACE_WITH_YOUR_DASHSCOPE_API_KEY"
+  embedding_base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  # 上下文窗口大小（token）。历史装载预算 = min(窗口 × compress.budget_ratio, compress.max_load_tokens)；
+  # 装不进预算的较早轮次会被压缩为滚动摘要（详见下方 compress 段）。
+  # 【务必填真实值】deepseek-v4-pro 官方上下文长度为 1,000,000（1M）。
+  # 配小会让溢出校验误判、压缩触发过早（本项曾误配为 131072）。
+  context_window: 1000000
+  # 【主对话】思考模式："enabled"（默认，留空即此）/ "disabled"。
+  # deepseek-v4-pro 默认开启思考，思维链与正式回答共享输出预算。
+  # 实测同一问题：开启时输出 4943 token（reasoning 4653、正式回答 1106 字符）；
+  # 关闭后输出 605 token（无 reasoning、正式回答 2284 字符）——省约 88% 输出成本，回答反而更完整。
+  thinking_mode: "enabled"
+  # 【辅助调用】（压缩摘要 / 相关性判定 / 意图分类）的思考模式；留空按 "disabled" 处理。
+  thinking_aux_mode: "disabled"
+  # 为模型输出预留的 token 数（从装载预算中扣除）。
+  # 【重要】deepseek-v4-pro 默认开启【思考模式】，思维链同样占用输出预算：
+  # 实测一个中等推理问题消耗 4943 个输出 token，其中 4653 为 reasoning（占 94%）。
+  # 因此输出预留必须覆盖"思维链 + 正式回答"，而非仅回答本身。
+  output_reserve: 8192
+  # 请求中显式设置的 max_tokens；<=0 表示不设置、沿用供应商默认值。
+  # 【重要】不要设为 4096 这类偏小值：思考模式下思维链会先耗尽预算，
+  # 实测 max_tokens=2000/4096 会让一个需推理的问题【正式回答为空】（finish_reason=length）。
+  # 保持 0（沿用默认）最安全；若要显式设置，必须显著大于思维链长度。
+  max_output_tokens: 0
+  # 任务运行超时（秒）。注意：它约束的是【整个任务运行】（含工具循环内的多次模型调用、
+  # 以及上下文压缩的额外调用），不是"单次调用"。
+  # 【为何要放大】思考模式下单次调用就可能很慢：实测同一问题 关闭思考 3.2s（输出 138 tok）、
+  # 开启思考 64.8s（输出 3690 tok，含思维链），另一次同题直接超过 150s。
+  # 若沿用 120s，一旦任务内有工具调用（多次模型调用）或触发压缩，必然超时失败。
+  timeout_seconds: 300
+  # 单个任务单次运行允许的最大模型调用次数（防工具乒乓；<=0 时代码兜底为 15）
+  max_calls_per_task: 15
+  # 单个任务跨重试累计允许的最大模型调用次数（防队列级重试放大成本；<=0 不限制）
+  max_total_calls_per_task: 30
+  # 模型单价（美元 / 百万 token），用于 CostUSD 折算。
+  # 以下按 deepseek-v4-pro 官方价目折算（官方公布为人民币：输入命中 0.025 / 未命中 3 / 输出 6，
+  # 按汇率约 7.15 折美元）。单价配错会直接导致成本核算失真。
+  # 注意：缓存命中价约为未命中价的 1/120 —— 缓存收益极大，这正是"保持提示前缀稳定"的核心动机。
+  cost_per_1m_in: 0.42
+  cost_per_1m_in_cached: 0.0035
+  cost_per_1m_out: 0.84
+
+# 对话上下文管理与自动压缩（大模型摘要）配置。
+# 装载由 token 预算驱动（预算 = context_window × budget_ratio）；装不进预算的较早轮次
+# 会被【由旧向新】分批压缩为滚动摘要，压缩游标记录在 conversations.summary_cutoff。
+compress:
+  enabled: true
+  max_load_turns: 200  # 单次任务装载历史的安全上限（实际装载量由 token 预算决定，仅防极端）
+  keep_recent: 6       # 压缩后保留的最近原始轮数，同时是装载的最低保障轮数
+  min_turns: 8         # 溢出少于该轮数时容忍不压缩
+  budget_ratio: 0.6    # 装载预算占上下文窗口的比例
+  # 装载预算的绝对上限（成本与质量护栏）：窗口为 1M 时，纯按比例装载会是 60 万 token，
+  # 未命中缓存约 1.8 元/次，且上下文过长会带来质量退化与更高延迟。设为 0 表示不限制。
+  max_load_tokens: 200000
+  max_compress_input_tokens: 30000  # 单批压缩请求的输入 token 上限（含已有摘要与提示词模板）
+  max_compress_turns: 50            # 单批压缩的轮数上限
+  max_compress_rounds: 10           # 单次任务运行内最多压缩的批数（一批 = 一次 LLM 调用）
+  max_summary_tokens: 3000          # 滚动摘要长度上限（超出触发一次精简）
+
+# 用户向长期记忆（跨会话）：把用户说过的事实/偏好持久化，后续会话按需召回注入。
+# 与 compress 的分工：compress = 单会话内不丢信息；本模块 = 换了会话还记得。
+# 与 RAG/KAG 的分工：RAG/KAG 召回"关于世界的文档知识"，本模块召回"关于用户自身的状态"。
+# 【灰度】默认全关；开启顺序建议：先 write_enabled 手工写入验证召回，再考虑开 enabled。
+memory:
+  enabled: false            # 召回总开关（false 时完全不读库、不注入，行为与改造前一致）
+  write_enabled: false      # 写入开关（注意：不约束删除——用户的删除权不能被开关挡住）
+  max_recall_items: 8       # 单次召回条数上限
+  max_recall_tokens: 800    # 召回块 token 上限（从装载预算中扣除，避免挤压历史装载）
+  max_profile_tokens: 400   # 常驻偏好块 token 上限（拼进 system prompt）
+  max_content_chars: 512    # 单条记忆字符上限（写入闸门，与列宽 varchar(1024) 同源）
+  per_user_limit: 500       # 每用户记忆条数上限
+  episodic_ttl_days: 90     # 经历类记忆有效天数（semantic/preference 不受此约束）
+
+# 召回重排（rerank）使用阿里云百炼 DashScope 的 qwen3-rerank 云端重排模型。
+# api_key 复用下方 llm.embedding_api_key 相同的阿里云百炼密钥。
+rerank:
+  enabled: true
+  base_url: "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
+  api_key: "REPLACE_WITH_YOUR_DASHSCOPE_API_KEY"
+  model: "qwen3-rerank"
+  top_n: 3
+
+# 知识库上下文渐进式披露（目标五）：摘要层 + 命中片段截断 + 总量上限
+context:
+  max_chunk_chars: 800       # 单个命中片段最大注入字符数（超长截断）
+  max_context_chars: 6000    # 知识上下文总字符数上限
+  rag_score_threshold: 0.5   # RAG 分层阈值（min-max 归一化 [0,1]；<=0 不启用分层）
+  graph_top_n: 10            # KAG 图谱命中关系条数上限
+  chunk_context_window: 1    # 上下文感知分块（B1）窗口大小：命中块前后各扩展的相邻块数（0=关闭）
+  enable_parent_context: true # 是否启用上一级文档上下文兜底（存量缺 chunk_index 时回退 Document.Content）
+
+# Agent 检索/工具路由（意图识别，成本优化）：在检索之前判断是否需要执行 RAG/KAG。
+# 三级混合：rule（纯寒暄短路，零调用）→ semantic（原型向量比对，1 次 embedding）→ LLM（默认二分类）。
+# 任一环节失败/低置信/疑似注入/无检索能力时，保守回退到全量检索。
+intent:
+  enabled: false              # 总开关，默认关闭；验证通过后再开启
+  mode: "rule"                # rule | semantic | hybrid
+  semantic_high: 0.86         # 语义层采信阈值（需用评测集校准）
+  semantic_margin: 0.05       # top1 与「异类 top2」的最小间隔
+  semantic_allow_close: false # 是否允许语义层「关闭检索」（需漏检率 ≤2% 才可开启）
+  llm_min_confidence: 0.6     # LLM 分类结果采信阈值，低于则走安全阀回退
+  route_timeout_seconds: 5    # 路由阶段（语义+LLM）总超时（秒）
+  enable_tool_routing: false  # 是否按意图裁剪工具（默认 false，暂不裁剪）
+
+milvus:
+  host: "127.0.0.1"
+  port: 19530
+  collection_name: "kb_chunks"
+  dim: 1024

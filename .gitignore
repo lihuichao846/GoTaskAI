@@ -24,3 +24,7 @@ Thumbs.db
 
 # 文档目录（不随远程仓库上传）
 docs/
+
+# 本地配置文件（含真实密钥，禁止入库；模板见 config/config.example 系列）
+config/config.yaml
+config/config.docker.yaml
